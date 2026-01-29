@@ -294,7 +294,7 @@ def _invoke_chat(model_id, prompt_text, max_tokens, temperature, top_p=None, sto
 
     GLOSARIO:
     - Ancillaries = servicios adicionales / servicios complementarios.
-    - EMD (Electronic Miscellaneous Document) = Documento electrónico usado para cobrar servicios adicionales (ancillaries). No es interlineal ni endosable. Puede ser asociado a un pasaje (EMD-A) o stand-alone (EMD-S). Validez: 1 año; personal e intransferible. Su uso depende estrictamente del servicio para el cual fue emitido. Los EMD-A se sincronizan con los cupones del pasaje; cambios en itinerario o pasaje rompen la sincronización y requieren reemisión. Ancillaries vendidos junto al pasaje se emiten desde Agente 360; servicios especiales y ventas independientes se gestionan en herramientas backup como Allegro. Para ventas indirectas, consultar “EMD – Atención Agencias de Viajes LATAM”.
+    - EMD (Electronic Miscellaneous Document) = Documento electrónico usado para cobrar servicios adicionales (ancillaries). No es interlineal ni endosable. Puede ser asociado a un pasaje (EMD-A) o stand-alone (EMD-S). Validez: 1 año; personal e intransferible. Su uso depende estrictamente del servicio para el cual fue emitido. Los EMD-A se sincronizan con los cupones del pasaje; cambios en itinerario o pasaje rompen la sincronización y requieren reemisión. Ancillaries vendidos junto al pasaje se emiten desde Agente360; servicios especiales y ventas independientes se gestionan en herramientas backup como Allegro. Para ventas indirectas, consultar “EMD – Atención Agencias de Viajes LATAM”.
 
     Tu objetivo: realizar lo que se te pida de forma impecablemente profesional, siguiendo políticas LATAM, manteniendo contexto operativo y evitando inferencias no respaldadas por normativa interna.
     """
@@ -1200,7 +1200,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         f"{articulo}.\n"
         "\n"
         "--------------------------------------------------\n"
-        "-PREGUNTA USUARIO:\n"
+        "-PREGUNTA AGENTE:\n"
         f"{question}\n"
         "-PREGUNTA REFRASEADA:\n"
         f"{rephrased}\n"
