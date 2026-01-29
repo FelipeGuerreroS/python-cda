@@ -481,13 +481,32 @@ def _invoke_chat_with_timeout(
     # 3) Respuesta OK
     return result["value"] or "", False
 
-def retrieve_kb(txt):
+def _normalize_language_filter(language: Optional[str]) -> str:
+    if not language:
+        return "español"
+    normalized = language.strip().lower()
+    if normalized in ("es", "español"):
+        return "español"
+    if normalized in ("pt", "portugues"):
+        return "portugues"
+    return normalized
+
+
+def retrieve_kb(txt: str, language: Optional[str]) -> list[dict]:
+    normalized_language = _normalize_language_filter(language)
+    metadata_filter = {
+        "equals": {
+            "key": "idioma",
+            "value": normalized_language,
+        }
+    }
     kb_resp = bedrock_agent.retrieve(
         knowledgeBaseId=KB_ID,
         retrievalConfiguration={
             "vectorSearchConfiguration": {
                 "numberOfResults": CONFIG.kb_max_results,
                 "overrideSearchType": CONFIG.kb_search_type,
+                "filter": metadata_filter,
             }
         },
         retrievalQuery={"text": txt}
@@ -999,8 +1018,8 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     question_chunks = []
     rephrased_chunks = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        question_retrieve = executor.submit(retrieve_kb, question)
-        rephrased_retrieve = executor.submit(retrieve_kb, rephrased)
+        question_retrieve = executor.submit(retrieve_kb, question, language)
+        rephrased_retrieve = executor.submit(retrieve_kb, rephrased, language)
         try:
             question_chunks = question_retrieve.result()
             question_chunks = normalize_results(question_chunks, "original")
