@@ -5,62 +5,181 @@ import time
 import threading
 import base64
 import uuid
+import logging
+from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import boto3
-import requests
-from botocore.exceptions import ClientError
-from boto3.dynamodb.conditions import Key
-import concurrent.futures
-from urllib.parse import urlparse, urlunparse
-from typing import Any, Mapping, Tuple, Optional
-from decimal import Decimal
-from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError, ReadTimeoutError, ConnectTimeoutError
-from time import perf_counter
 from collections import defaultdict
+from decimal import Decimal
+from time import perf_counter
+from typing import Any, Mapping, Tuple, Optional
+from urllib.parse import urlparse, urlunparse
+
+import boto3
+import concurrent.futures
+import requests
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import (
+    BotoCoreError,
+    ClientError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+    ConnectTimeoutError,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _configure_logging(level: str) -> None:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=level, format="%(message)s")
+    LOGGER.setLevel(level)
+
+
+def _log_print(*args: Any, **kwargs: Any) -> None:
+    sep = kwargs.get("sep", " ")
+    message = sep.join(str(arg) for arg in args)
+    LOGGER.info(message)
+
+
+# Reasignamos print localmente para mantener los mensajes y usar logging en Lambda.
+print = _log_print  # type: ignore[assignment]
+
+
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def _get_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _get_float_env(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.lower() in ("true", "1", "yes")
+
+
+@dataclass(frozen=True)
+class Config:
+    aws_region: str
+    conversations_table: str
+    questions_table: str
+    kb_id: str
+    haiku_model_id: str
+    haiku_45_model_id: str
+    sonnet_model_id: str
+    sonnet_37_model_id: str
+    sonnet_4_model_id: str
+    titan_premier_model_id: str
+    titan_express_model_id: str
+    gpt_oss_120_model_id: str
+    answer_max_tokens: int
+    guardrail_id: str
+    guardrail_ver: str
+    trace: str
+    anthropic_version: str
+    categories: list[str]
+    include_exec_times: bool
+    kb_max_results: int
+    kb_search_type: str
+    s3_files_prefix: str
+    invoke_timeout_seconds: float
+    bedrock_runtime_fallback_region: str
+    log_level: str
+
+
+def load_config() -> Config:
+    return Config(
+        aws_region=_require_env("REGION"),
+        conversations_table=_require_env("CONVERSATIONS_TABLE"),
+        questions_table=_require_env("QUESTIONS_TABLE"),
+        kb_id=_require_env("KB_ID"),
+        haiku_model_id=_require_env("HAIKU_MODEL_ID"),
+        haiku_45_model_id=_require_env("HAIKU_45_MODEL_ID"),
+        sonnet_model_id=_require_env("SONNET_MODEL_ID"),
+        sonnet_37_model_id=_require_env("SONNET_37_MODEL_ID"),
+        sonnet_4_model_id=_require_env("SONNET_4_MODEL_ID"),
+        titan_premier_model_id=_require_env("TITAN_PREMIER_MODEL_ID"),
+        titan_express_model_id=_require_env("TITAN_EXPRESS_MODEL_ID"),
+        gpt_oss_120_model_id=_require_env("GPT_OSS_120_MODEL_ID"),
+        answer_max_tokens=_get_int_env("ANSWER_MAX_TOKENS", 6000),
+        guardrail_id=os.environ.get("GUARDRAIL_ID", "sdsuv2s4z9op"),
+        guardrail_ver=os.environ.get("GUARDRAIL_VER", "DRAFT"),
+        trace=os.environ.get("TRACE", "ENABLED"),
+        anthropic_version=os.environ.get("ANTHROPIC_VERSION", "bedrock-2023-05-31"),
+        categories=os.environ.get("CATEGORIES", "").split(","),
+        include_exec_times=_get_bool_env("INCLUDE_EXEC_TIMES", True),
+        kb_max_results=_get_int_env("KB_MAX_RESULTS", 10),
+        kb_search_type=os.environ.get("KB_SEARCH_TYPE", "HYBRID"),
+        s3_files_prefix=os.environ.get("S3_FILES_PREFIX", "s3://files-cda/"),
+        invoke_timeout_seconds=_get_float_env("INVOKE_TIMEOUT_SECONDS", 27.5),
+        bedrock_runtime_fallback_region=os.environ.get(
+            "BEDROCK_RUNTIME_FALLBACK_REGION",
+            "us-west-2",
+        ),
+        log_level=os.environ.get("LOG_LEVEL", "INFO"),
+    )
 
 ## FUNCIONES PARA MARCAR TIEMPOS DE EJECUCIÓN
 
-def tstart():
+def tstart() -> float:
     return perf_counter()
 
-def mark(execution_times: dict, key: str, t0: float):
+def mark(execution_times: dict, key: str, t0: float) -> None:
     execution_times[key] = round(perf_counter() - t0, 4)
 
 ## VARIABLES GLOBALES
 
+CONFIG = load_config()
+_configure_logging(CONFIG.log_level)
+
 # ENV
-AWS_REGION           = os.environ['REGION']
-CONV_TABLE_NAME      = os.environ['CONVERSATIONS_TABLE']
-QUESTIONS_TABLE_NAME = os.environ['QUESTIONS_TABLE']
-KB_ID                = os.environ['KB_ID']
+AWS_REGION = CONFIG.aws_region
+CONV_TABLE_NAME = CONFIG.conversations_table
+QUESTIONS_TABLE_NAME = CONFIG.questions_table
+KB_ID = CONFIG.kb_id
 
 # MODELOS
-HAIKU_MODEL_ID       = os.environ['HAIKU_MODEL_ID']
-HAIKU_45_MODEL_ID    = os.environ['HAIKU_45_MODEL_ID']
-SONNET_MODEL_ID      = os.environ['SONNET_MODEL_ID']  
-SONNET_37_MODEL_ID   = os.environ['SONNET_37_MODEL_ID']
-SONNET_4_MODEL_ID    = os.environ['SONNET_4_MODEL_ID']
-TITAN_PREMIER_MODEL_ID = os.environ['TITAN_PREMIER_MODEL_ID']
-TITAN_EXPRESS_MODEL_ID = os.environ['TITAN_EXPRESS_MODEL_ID']
-GPT_OSS_120_MODEL_ID   = os.environ['GPT_OSS_120_MODEL_ID']
+HAIKU_MODEL_ID = CONFIG.haiku_model_id
+HAIKU_45_MODEL_ID = CONFIG.haiku_45_model_id
+SONNET_MODEL_ID = CONFIG.sonnet_model_id
+SONNET_37_MODEL_ID = CONFIG.sonnet_37_model_id
+SONNET_4_MODEL_ID = CONFIG.sonnet_4_model_id
+TITAN_PREMIER_MODEL_ID = CONFIG.titan_premier_model_id
+TITAN_EXPRESS_MODEL_ID = CONFIG.titan_express_model_id
+GPT_OSS_120_MODEL_ID = CONFIG.gpt_oss_120_model_id
 
-#OUTPUT IA
-ANSWER_MAX_TOKENS = int(os.environ.get('ANSWER_MAX_TOKENS', '6000'))
-GUARDRAIL_ID = "sdsuv2s4z9op"
-GUARDRAIL_VER = "DRAFT"
-TRACE = "ENABLED"
-ANTHROPIC_VERSION    = "bedrock-2023-05-31"
+# OUTPUT IA
+ANSWER_MAX_TOKENS = CONFIG.answer_max_tokens
+GUARDRAIL_ID = CONFIG.guardrail_id
+GUARDRAIL_VER = CONFIG.guardrail_ver
+TRACE = CONFIG.trace
+ANTHROPIC_VERSION = CONFIG.anthropic_version
 
-#OTROS
-CATEGORIES = os.environ.get('CATEGORIES', '').split(',') #DEPRECADO: SE DEJA POR SI CAMBIA A FUTURO
-INCLUDE_EXEC_TIMES = os.environ.get('INCLUDE_EXEC_TIMES', 'true').lower() in ('true', '1', 'yes')
+# OTROS
+CATEGORIES = CONFIG.categories  # DEPRECADO: SE DEJA POR SI CAMBIA A FUTURO
+INCLUDE_EXEC_TIMES = CONFIG.include_exec_times
 
 ## CLIENTES AWS
 dynamo              = boto3.resource('dynamodb', region_name=AWS_REGION)
 bedrock_agent       = boto3.client('bedrock-agent-runtime', region_name=AWS_REGION)
 bedrock_runtime     = boto3.client('bedrock-runtime', region_name=AWS_REGION)
-bedrock_runtime_usw2= boto3.client('bedrock-runtime', region_name='us-west-2') 
+bedrock_runtime_usw2= boto3.client('bedrock-runtime', region_name=CONFIG.bedrock_runtime_fallback_region) 
 s3_client           = boto3.client('s3', region_name=AWS_REGION)
 
 #TABLAS DYNAMO
@@ -79,7 +198,7 @@ _S3_RE = re.compile(
     re.IGNORECASE | re.VERBOSE
 )
 
-def parse_request(event):
+def parse_request(event: Mapping[str, Any]) -> Tuple[dict, Optional[str]]:
     """
     Devuelve (data_dict, err) donde data_dict al menos contiene 'question' si es posible.
     Pensado para AWS API Gateway HTTP API v2:
@@ -312,7 +431,15 @@ def _invoke_chat(model_id, prompt_text, max_tokens, temperature, top_p=None, sto
         return data["results"][0].get("outputText", "")
     return ""
 
-def _invoke_chat_with_timeout(model_id, prompt_text, max_tokens, temperature, top_p=None, stop_sequences=None, timeout_seconds=27.5):
+def _invoke_chat_with_timeout(
+    model_id,
+    prompt_text,
+    max_tokens,
+    temperature,
+    top_p=None,
+    stop_sequences=None,
+    timeout_seconds=None,
+):
     """
     Envuelve _invoke_chat con un timeout duro.
     - Si el modelo responde antes del timeout → devuelve (respuesta, False)
@@ -334,6 +461,9 @@ def _invoke_chat_with_timeout(model_id, prompt_text, max_tokens, temperature, to
         except Exception as e:
             error["exc"] = e
 
+    if timeout_seconds is None:
+        timeout_seconds = CONFIG.invoke_timeout_seconds
+
     t = threading.Thread(target=runner, daemon=True)
     t.start()
     t.join(timeout_seconds)
@@ -351,13 +481,32 @@ def _invoke_chat_with_timeout(model_id, prompt_text, max_tokens, temperature, to
     # 3) Respuesta OK
     return result["value"] or "", False
 
-def retrieve_kb(txt):
+def _normalize_language_filter(language: Optional[str]) -> str:
+    if not language:
+        return "español"
+    normalized = language.strip().lower()
+    if normalized in ("es", "español"):
+        return "español"
+    if normalized in ("pt", "portugues"):
+        return "portugues"
+    return normalized
+
+
+def retrieve_kb(txt: str, language: Optional[str]) -> list[dict]:
+    normalized_language = _normalize_language_filter(language)
+    metadata_filter = {
+        "equals": {
+            "key": "idioma",
+            "value": normalized_language,
+        }
+    }
     kb_resp = bedrock_agent.retrieve(
         knowledgeBaseId=KB_ID,
         retrievalConfiguration={
             "vectorSearchConfiguration": {
-                "numberOfResults": 10,
-                "overrideSearchType": "HYBRID"
+                "numberOfResults": CONFIG.kb_max_results,
+                "overrideSearchType": CONFIG.kb_search_type,
+                "filter": metadata_filter,
             }
         },
         retrievalQuery={"text": txt}
@@ -800,7 +949,10 @@ def convertir_links_html(resumen: str) -> str:
 
     return patron_url.sub(reemplazar, resumen)
 
-def lambda_handler(event, context):
+def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
+    """
+    AWS Lambda handler para procesar preguntas, recuperar contexto y generar respuestas.
+    """
     t0 = tstart()
     execution_times = {}
     print(f"----------INICIO - EVENTO RECIBIDO----------")
@@ -866,8 +1018,8 @@ def lambda_handler(event, context):
     question_chunks = []
     rephrased_chunks = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        question_retrieve = executor.submit(retrieve_kb, question)
-        rephrased_retrieve = executor.submit(retrieve_kb, rephrased)
+        question_retrieve = executor.submit(retrieve_kb, question, language)
+        rephrased_retrieve = executor.submit(retrieve_kb, rephrased, language)
         try:
             question_chunks = question_retrieve.result()
             question_chunks = normalize_results(question_chunks, "original")
@@ -967,7 +1119,7 @@ def lambda_handler(event, context):
         raw.get('location', {})
         .get('s3Location', {})
         .get('uri', '')
-        .replace('s3://files-cda/', '')
+        .replace(CONFIG.s3_files_prefix, '')
     )
 
     sel_text = (
