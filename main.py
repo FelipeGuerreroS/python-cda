@@ -37,6 +37,7 @@ KB_ID                = os.environ['KB_ID']
 
 # MODELOS
 HAIKU_MODEL_ID       = os.environ['HAIKU_MODEL_ID']
+HAIKU_45_MODEL_ID    = os.environ['HAIKU_45_MODEL_ID']
 SONNET_MODEL_ID      = os.environ['SONNET_MODEL_ID']  
 SONNET_37_MODEL_ID   = os.environ['SONNET_37_MODEL_ID']
 SONNET_4_MODEL_ID    = os.environ['SONNET_4_MODEL_ID']
@@ -157,7 +158,7 @@ def parse_request(event):
 
 def _select_bedrock_client(model_id: str):
     if model_id.startswith("openai.gpt-oss"):
-        return bedrock_runtime_usw2
+        return bedrock_runtime
     return bedrock_runtime
 
 def _invoke_chat(model_id, prompt_text, max_tokens, temperature, top_p=None, stop_sequences=None):
@@ -169,7 +170,15 @@ def _invoke_chat(model_id, prompt_text, max_tokens, temperature, top_p=None, sto
     accept       = "application/json"
     content_type = "application/json"
 
-    system_prompt = "Realiza lo que se te pida lo más profesional posible."
+    system_prompt = """
+    Eres un Asistente IA Profesional para LATAM (Agente LATAM), especializado en soporte operativo, normativo y documental de procesos internos de la aerolínea. Responde siempre con precisión, claridad y enfoque operativo.
+
+    GLOSARIO:
+    - Ancillaries = servicios adicionales / servicios complementarios.
+    - EMD (Electronic Miscellaneous Document) = Documento electrónico usado para cobrar servicios adicionales (ancillaries). No es interlineal ni endosable. Puede ser asociado a un pasaje (EMD-A) o stand-alone (EMD-S). Validez: 1 año; personal e intransferible. Su uso depende estrictamente del servicio para el cual fue emitido. Los EMD-A se sincronizan con los cupones del pasaje; cambios en itinerario o pasaje rompen la sincronización y requieren reemisión. Ancillaries vendidos junto al pasaje se emiten desde Agente 360; servicios especiales y ventas independientes se gestionan en herramientas backup como Allegro. Para ventas indirectas, consultar “EMD – Atención Agencias de Viajes LATAM”.
+
+    Tu objetivo: realizar lo que se te pida de forma impecablemente profesional, siguiendo políticas LATAM, manteniendo contexto operativo y evitando inferencias no respaldadas por normativa interna.
+    """
 
     if is_anthropic:
         payload = {
@@ -303,7 +312,7 @@ def _invoke_chat(model_id, prompt_text, max_tokens, temperature, top_p=None, sto
         return data["results"][0].get("outputText", "")
     return ""
 
-def _invoke_chat_with_timeout(model_id, prompt_text, max_tokens, temperature, top_p=None, stop_sequences=None, timeout_seconds=26):
+def _invoke_chat_with_timeout(model_id, prompt_text, max_tokens, temperature, top_p=None, stop_sequences=None, timeout_seconds=27.5):
     """
     Envuelve _invoke_chat con un timeout duro.
     - Si el modelo responde antes del timeout → devuelve (respuesta, False)
@@ -345,10 +354,15 @@ def _invoke_chat_with_timeout(model_id, prompt_text, max_tokens, temperature, to
 def retrieve_kb(txt):
     kb_resp = bedrock_agent.retrieve(
         knowledgeBaseId=KB_ID,
-        retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": 6}},
+        retrievalConfiguration={
+            "vectorSearchConfiguration": {
+                "numberOfResults": 10,
+                "overrideSearchType": "HYBRID"
+            }
+        },
         retrievalQuery={"text": txt}
     )
-    return kb_resp.get('retrievalResults', [])
+    return kb_resp.get("retrievalResults", [])
 
 def normalize_results(results, source_label, max_description_len=15000):
     normalized = []
@@ -571,13 +585,13 @@ def normalizar_links(lista_links):
     return sorted(urls_limpias)
 
 def normalize_s3_uri(u: str) -> str:
-    """Normaliza variantes comunes de prefijo s3 y quita puntuación final habitual."""
     if not isinstance(u, str):
         return ""
     u = u.strip()
     u = re.sub(r'^s3(?:::|//)', 's3://', u)
     u = re.sub(r'^s3:/', 's3://', u)
-    u = u.rstrip('),.;')
+    # limpia cierres/puntuación comunes
+    u = u.rstrip('),.;:]}"\'')
     return u
 
 def fetch_s3_text(uri: str) -> str:
@@ -799,6 +813,8 @@ def lambda_handler(event, context):
     print(f"PREGUNTA: ",question)
     session_id = (data or {}).get('session_id')
     print(f"ID DE INTERACCIÓN: ",session_id)
+    language = (data or {}).get('language')
+    print(f"IDIOMA: ",language)
 
     if not question:
         print("No 'question' in body")
@@ -829,7 +845,9 @@ def lambda_handler(event, context):
     rephrase_prompt = (
         "Contexto:\n"
         + "\n".join(rephrase_context)
-        + "\n\nReformula en una sola pregunta la consulta anterior. Devuelve SOLO la pregunta.\n\n"
+        + "\n\nReformula la consulta anterior en una sola pregunta. "
+        f"En IDIOMA: {language}."
+        "Devuelve SOLO la pregunta reformulada.\n\n"
         "Pregunta reformulada:"
     )
     try:
@@ -845,169 +863,230 @@ def lambda_handler(event, context):
     t3 = tstart()
     print(f"----------INICIO - RETRIEVE DOCS----------")
     category = "Sin categoría"
-    refs = []
+    question_chunks = []
+    rephrased_chunks = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        fut_kb = executor.submit(retrieve_kb, question)
+        question_retrieve = executor.submit(retrieve_kb, question)
+        rephrased_retrieve = executor.submit(retrieve_kb, rephrased)
         try:
-            refs = fut_kb.result()
+            question_chunks = question_retrieve.result()
+            question_chunks = normalize_results(question_chunks, "original")
+            print(f"1)  CHUNK QUESTION")
+            print(f"{question_chunks}")
+            print("--------")
+            
+            rephrased_chunks = rephrased_retrieve.result()
+            rephrased_chunks = normalize_results(rephrased_chunks, "rephrased")
+            print(f"2) CHUNK REPHRASED")
+            print(f"{rephrased_chunks}")
+            print("--------")
         except Exception:
-            refs = []
+            question_chunks = []
+            rephrased_chunks = []
+
     mark(execution_times, 'categorizationAndRag', t3)
-
-    t4 = tstart()
-    # 5) Chunk selection
-    top_refs = refs[:3]
-
-    fragments = []          # aquí guardaremos los 2 artículos ya “expandido” con TABLA/FLUJO resueltas
-    all_links = []          # si quieres tener todos los links juntos
-    rag_files = []          # por si quieres saber de qué archivo salió cada fragmento
-
-    # --- Regex y helpers comunes para todos los resultados ---
-    pattern = re.compile(r'\[(TABLA)\]\s*(s3://\S+)', flags=re.IGNORECASE)
-
-    for rank, selected in enumerate(top_refs):
-        # --- Info básica del resultado ---
-        rag_file = (
-            selected
-            .get('location', {})
-            .get('s3Location', {})
-            .get('uri', '')
-            .replace('s3://files-cda/txt/Artículos/', '')
-        )
-        rag_files.append(rag_file)
-
-        sel_text = selected.get('content', {}).get('text', '').replace('\r', '')
-        print(f"Resultado #{rank+1} - sel_text:", sel_text)
-
-        # --- Metadatos: tablas + flujos + urls ---
-        uris = (
-            selected.get('metadata', {}).get('tablas', [])
-        )
-
-        links = selected.get('metadata', {}).get('urls', [])
-        links = normalizar_links(links)
-        all_links.extend(links)
-
-        print(f"Resultado #{rank+1} - LINKS:", links)
-
-        extra_sections = []
-        metadata_list = []
-
-        for uri in uris:
-            try:
-                raw_txt = fetch_s3_text(uri)
-                txt = re.sub(r'\s+', ' ', raw_txt.replace('\n', '')).strip()
-                metadata_list.append({"uri": uri, "content": txt})
-            except Exception as e:
-                error_msg = f"Error {e}"
-                extra_sections.append(f"{uri}: {error_msg}")
-                metadata_list.append({"uri": uri, "content": error_msg})
-
-        # --- Construye un mapa uri -> contenido (URIs normalizadas) ---
-        uri_to_content = {
-            normalize_s3_uri(item.get("uri", "")): (item.get("content", "") or "")
-            for item in metadata_list
-        }
-
-        def replace_match(m: re.Match) -> str:
-            kind = m.group(1).upper()  # TABLA o FLUJO
-            uri_raw = m.group(2)
-            uri_norm = normalize_s3_uri(uri_raw)
-            content = uri_to_content.get(uri_norm, "")
-            file_name = os.path.basename(uri_norm) or uri_norm.split('/')[-1]
-
-            if not content:
-                # Si no lo encontramos, conserva la referencia original y marca el fallo
-                return f'[{kind}] {uri_raw} [NO ENCONTRADO EN METADATA]'
-
-            fin_tag = end_tag_for_uri(uri_norm, kind)
-            return f'[{kind}] {{ {content} }} [{fin_tag}]'
-
-        # --- Aplica el reemplazo al texto del artículo actual ---
-        sel_text_replaced = pattern.sub(replace_match, sel_text)
-
-        # Guardamos cada resultado como un fragmento independiente
-        fragments.append({
-            "rank": rank,             # 0 = mejor, 1 = segundo mejor
-            "rag_file": rag_file,     # nombre del archivo base
-            "text": sel_text_replaced,  # texto del artículo con TABLA/FLUJO ya imputados
-            "links": links,           # urls asociadas a este resultado
-            "metadata": metadata_list # lista de tablas/flujos resueltas
-        })
-
-    # Si quieres tener un solo texto concatenado de los dos resultados:
-    texto_unico = "\n\n---\n\n".join(frag["text"] for frag in fragments)
-
-    
     print(f"----------FIN - RETRIEVE DOCS----------")
     print("***********************************************************")
-  
+    t4 = tstart()
+    print(f"----------INICIO - SELECCIÓN ARTICULO----------")
+    consensus_doc = same_top_doc(
+        question_chunks,
+        rephrased_chunks,
+        min_score=0.53,
+        debug=False
+    )
+    if consensus_doc:
+        selected_doc = consensus_doc
+        print("SELECCIÓN CONSENSUADA")
+    else:
+        merged_docs = merge_results(question_chunks, rephrased_chunks)
+        heuristic_doc = pick_by_heuristics(
+            merged_docs,
+            min_avg_score=0.69,
+            max_rank_allowed=2,
+            debug=True
+        )
+        if heuristic_doc:
+            selected_doc = heuristic_doc
+            print("SELECCIÓN HEURISTICA")
+        else:
+            candidate_docs = build_llm_candidates_payload(merged_docs, max_candidates=6)
+            docs_text = ""
+            for d in candidate_docs:
+                raw_doc = (d.get("doc") or {}).get("raw", {})
+                full_text = raw_doc.get("content", {}).get("text", "")
+                sample = (full_text[:750] + "...") if len(full_text) > 750 else full_text
+                docs_text += (
+                    f"Documento {d['id']}:\n"
+                    f"  id: {d['id']}\n"
+                    f"  título: {d['title']}\n"
+                    f"  descripción: {d['description']}\n"
+                    f"  sample:\n{sample}\n\n"
+                )
+
+            print("docs_txt_ia: ",docs_text)
+            prompt_chunks = (
+                f"Tu tarea es LEER atentamente la pregunta del usuario y las descripciones de los artículos, y escoger un único artículo que mejor responda a la pregunta.\n"
+                f"Responde ÚNICAMENTE con el id del archivo que mejor responde la pregunta.\n"
+                f"Pregunta original:\n{question}\n\n"
+                f"Pregunta parafraseada:\n{rephrased}\n\n"
+                f"A continuación tienes los posibles artículos candidatos, con título, descripción:\n"
+                f"\n{docs_text}\n\n"
+                f"Responde ÚNICAMENTE con el id del documento que consideres más relevante (campo 'id'), sin ningún texto adicional, explicación ni formato extra.\n\n"
+            )
+            chosen_id = _invoke_chat(HAIKU_MODEL_ID, prompt_chunks, max_tokens=10, temperature=0.0).strip()
+            print("CHOSEN ID - IA: ", chosen_id)
+            
+            chosen_candidate = next((c for c in candidate_docs if c["id"] == chosen_id), None)
+
+            if not chosen_candidate:
+                print("No se encontró candidato para ese id, fallback a primero")
+                chosen_candidate = candidate_docs[0]
+
+            # if chosen_id is '1':
+            #     selected_doc_aux = candidate_docs[1]      ##SEGUNDO:candidate_docs[1]
+            # else:
+            #     selected_doc_aux = candidate_docs[0]
+
+            selected_doc = chosen_candidate["doc"]
+            print("SELECCIÓN IA")
+
+    print("---------")
+    print(f"ARTICULO A UTILIZAR:")
+    print(f"{selected_doc}")
+    print("---------")
 
     mark(execution_times, 'chunkSelection_totalTime', t4)
-    # print(f"----------FIN - SELECCIÓN ARTICULO----------")
-    # print("***********************************************************")
+    print(f"----------FIN - SELECCIÓN ARTICULO----------")
+    print("***********************************************************")
     t5 = tstart()
+    print(f"----------INICIO - INYECCIÓN DEPENDENCIAS----------")
+    raw = selected_doc.get("raw", {})  # chunk original de Bedrock
 
+    rag_files = (
+        raw.get('location', {})
+        .get('s3Location', {})
+        .get('uri', '')
+        .replace('s3://files-cda/', '')
+    )
+
+    sel_text = (
+        raw.get('content', {})
+        .get('text', '')
+        .replace('\r', '')
+    )
+    print("LEN articulo antes de dependencias: ",len(sel_text))
+    print(sel_text)
+
+    meta = raw.get('metadata', {})
+    uris = meta.get('tablas', []) + meta.get('flujos', [])
+    links = meta.get('urls', [])
+    links = normalizar_links(links)
+
+    metadata_response = {
+        "tablas": meta.get("tablas", []),
+        "flujos": meta.get("flujos", []),
+    }
+    
+    metadata_list = []
+    for uri in uris:
+        try:
+            raw_txt = fetch_s3_text(uri)
+            txt = re.sub(r'\s+', ' ', raw_txt.replace('\n', ' '))
+            print("len flujo: ",len(txt))
+            metadata_list.append({"uri": uri, "content": txt})
+        except Exception as e:
+            metadata_list.append({"uri": uri, "content": error_msg})
+
+    # --- Construye un mapa uri -> contenido (URIs normalizadas) ---
+    uri_to_content = {
+        normalize_s3_uri(item.get("uri", "")): (item.get("content", "") or "")
+        for item in metadata_list
+    }
+
+    # --- Reemplazo en sel_text ---
+    # Captura [TABLA] o [FLUJO] seguido de una URI s3. La URI termina en whitespace (espacio/salto de línea).
+    pattern = re.compile(
+        r'\[(TABLA|FLUJO)\]([\s\S]*?)(s3://.*?\.(?:csv|txt|json))',
+        flags=re.IGNORECASE | re.UNICODE
+    )
+
+    def replace_match(m: re.Match) -> str:
+        kind = m.group(1).upper()
+        middle = m.group(2) or ""   # texto dinámico (incluye la flecha si viene)
+        uri_raw = m.group(3)
+
+        uri_norm = normalize_s3_uri(uri_raw)
+        content = uri_to_content.get(uri_norm, "")
+
+        if not content:
+            return f'[{kind}]{middle}{uri_raw} [NO ENCONTRADO EN METADATA]'
+
+        fin_tag = end_tag_for_uri(uri_norm, kind)
+        return f'[{kind}]{middle}{{ {content} }} [{fin_tag}]'
+
+    context_text = pattern.sub(replace_match, sel_text)
+    print("largo len despues de inyeccion dependencias:")
+    print(len(context_text))
+    print(context_text)
 
     mark(execution_times, 'loadChunk', t5)
     print(f"----------FIN - INYECCIÓN DEPENDENCIAS----------")
     print("***********************************************************")
     t6 = tstart()
     print(f"----------INICIO - GENERAR RESPUESTA----------")
-    articulo = "\n\n".join(texto_unico)
+    articulo = context_text
     print("LEN ARTICULO: ",len(articulo))
-    if len(articulo) > 31000:
-        print("articulo cortado")
-        articulo = articulo[:31000]
-    else:
-        articulo = articulo
 
     answer_prompt = (
-        "INSTRUCCIONES ESTRICTAS:\n"
+        "INSTRUCCIONES ESTRICTAS (SEGUIR AL PIE DE LA LETRA):\n"
         "\n"
-        "1) Tu ÚNICA fuente es la sección INFORMACIÓN.\n"
+        "1) FUENTE ÚNICA:\n"
+        "   — Solo puedes usar la sección INFORMACIÓN.\n"
         "   — No uses conocimientos externos.\n"
-        "   — No inventes datos no presentes.\n"
-        "   — Usa también evidencias indirectas.\n"
+        "   — No hagas inferencias fuera del texto.\n"
+        "   — No inventes pasos, plazos, políticas, procesos ni condiciones no mencionadas.\n"
         "\n"
-        "2) PROCESO INTERNO (no mostrar):\n"
-        "   — Identifica fragmentos relevantes.\n"
-        "   — Combina toda la información aplicable.\n"
+        "2) COBERTURA COMPLETA:\n"
+        "   — Si la INFORMACIÓN muestra reglas distintas por país (Argentina, Chile, Colombia, Uruguay, etc.), "
+        "debes incluir TODAS las reglas explícitas para CADA país mencionado.\n"
+        "   — No asumir que la pregunta se refiere solo a Chile.\n"
         "\n"
-        "3) CRITERIO DE RESPUESTA:\n"
-        "   — Responde si existe evidencia explícita o implícita.\n"
-        "   — Solo responde 'No encontrado en Información' si no hay ninguna referencia relacionada.\n"
+        "3) CUANDO FALTA INFORMACIÓN:\n"
+        "   — Si NO existe evidencia suficiente en INFORMACIÓN, responde EXACTAMENTE: 'No encontrado en Información'.\n"
+        "   — Si la información es PARCIAL, responde solo lo que sí aparece y menciona explícitamente qué puntos no están documentados.\n"
         "\n"
-        "4) USO DE INFORMACIÓN:\n"
-        "   — Utiliza el contenido, pero SIN mencionar pasos, numeraciones, fragmentos ni ubicaciones del texto.\n"
-        "\n"
-        "5) ESTILO:\n"
-        "   — Respuesta en ESPAÑOL, directa y precisa.\n"
-        "   — No incluyas enlaces salvo que provengan de INFORMACIÓN y empiecen por https, drive.google.com o docs.google.com.\n"
-        "\n"
-        "--------------------------------------------------\n"
-        "1) INFORMACIÓN:\n"
-        f"{articulo}\n"
+        "4) ESTILO DE RESPUESTA:\n"
+        f"   — Responde en IDIOMA:{language}.\n"
+        "   — Responde primero DE MANERA DIRECTA a la pregunta.\n"
+        "   — No incluyas enlaces a menos que estén en INFORMACIÓN y empiecen por https, drive.google.com o docs.google.com.\n"
+        "   — No repitas texto literal de los pasajes.\n"
         "\n"
         "--------------------------------------------------\n"
-        "2) PREGUNTA ORIGINAL:\n"
+        "-INFORMACIÓN:\n"
+        f"{articulo}.\n"
+        "\n"
+        "--------------------------------------------------\n"
+        "-PREGUNTA USUARIO:\n"
         f"{question}\n"
-        "2.1) PREGUNTA REFRASEADA:\n"
+        "-PREGUNTA REFRASEADA:\n"
         f"{rephrased}\n"
         "\n"
         "--------------------------------------------------\n"
-        "3) FORMATO DE SALIDA:\n"
+        "5) FORMATO DE SALIDA: RESPUESTA (ESTRICTO):\n"
+        "   <RESPUESTA>\n"
+        "   — Un único párrafo directo y específico respondiendo SOLO la pregunta.\n"
+        "   — Incluye números EXACTOS, condiciones EXACTAS y wording fiel del documento.\n"
+        "   — Se abre con '<RESPUESTA>' y se finaliza con '</RESPUESTA>'.\n"
+        "   </RESPUESTA>\n"
+        "5.1) FORMATO DE SALIDA: ADICIONAL (ESTRICTO):\n"
+        "   [ADICIONAL]\n"
+        "   — Lista de 2 a 10 viñetas con detalles adicionales relevantes, sin inventar nada.\n"
+        "   — Incluir reglas por país si existen.\n"
+        "   — No agregar pasos no mencionados en INFORMACIÓN.\n"
+        "   — Se abre con '[ADICIONAL]' y se finaliza con '[/ADICIONAL]'.\n"
+        "   [/ADICIONAL]\n"
         "\n"
-        "<RESUMEN>\n"
-        "Un único párrafo respondiendo la Pregunta.\n"
-        "Si no existe evidencia suficiente: 'No encontrado en Información'.\n"
-        "</RESUMEN>\n"
-        "\n"
-        "[ADICIONAL]\n"
-        "- Lista de 2 a 15 ítems.\n"
-        "- Incluye inferencias justificadas y aclaraciones útiles.\n"
-        "- NO repitas el texto del RESUMEN.\n"
-        "[/ADICIONAL]\n"
     )
     try:
         full_answer, timed_out = _invoke_chat_with_timeout(
@@ -1029,7 +1108,7 @@ def lambda_handler(event, context):
     print("***********************************************************")
     if not timed_out:
         t7 = tstart()
-        print(f"----------INICIO - PARSEAR RESUMEN Y INFO ADICIONAL----------")
+        print("----------INICIO - PARSEAR RESUMEN Y INFO ADICIONAL----------")
         resumen = ""
         info_adicional = ""
 
@@ -1039,15 +1118,15 @@ def lambda_handler(event, context):
         # ======== RESUMEN ========
         m = re.search(
             r'''
-            \[\s*RESUMEN\s*\]\s*
-            (.*?)                                   # contenido
+            \[\s*(?:RESPUESTA|RESPUEDA|RESPUESE|RESPUEDE)\s*\]\s*      # etiquetas [RESPUESTA]/[RESPUEDA]/[RESPUESE]/[RESPUEDE]
+            (.*?)                                                     # contenido
             \s*
             (?=
                 \[
-                /\s*RESUMEN\s*
+                /\s*(?:RESPUESTA|RESPUEDA|RESPUESE|RESPUEDE)\s*        # cierres [/RESPUESTA]/.../
                 \]
                 |
-                \[\s*(?:informaci[oó]n\s+adicional|adicional|detalles\s+adicionales)\s*\]
+                \[\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]
                 |
                 $
             )
@@ -1059,15 +1138,15 @@ def lambda_handler(event, context):
         else:
             m = re.search(
                 r'''
-                <\s*RESUMEN\s*>\s*
-                (.*?)                                # contenido
+                <\s*(?:RESPUESTA|RESPUEDA|RESPUESE|RESPUEDE)\s*>\s*     # <RESPUESTA/RESPUEDA/RESPUESE/RESPUEDE>
+                (.*?)                                                 # contenido
                 \s*
                 (?=
-                    </\s*RESUMEN\s*>
+                    </\s*(?:RESPUESTA|RESPUEDA|RESPUESE|RESPUEDE)\s*>   # </RESPUESTA/RESPUEDA/RESPUESE/RESPUEDE>
                     |
                     </\s*>
                     |
-                    \[\s*(?:informaci[oó]n\s+adicional|adicional|detalles\s+adicionales)\s*\]
+                    \[\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]
                     |
                     $
                 )
@@ -1080,16 +1159,17 @@ def lambda_handler(event, context):
                 m = re.search(r'<\s*([^<>]+?)\s*>', full_answer_norm, flags=re.DOTALL)
                 if m:
                     inner = m.group(1).strip()
-                    if inner.upper() != "RESUMEN":
+                    # No tomar etiquetas <RESPUESTA>, <RESPUEDA>, <RESPUESE> ni <RESPUEDE> como contenido
+                    if inner.upper() not in ("RESPUESTA", "RESPUEDA", "RESPUESE", "RESPUEDE"):
                         resumen = inner
 
         # ======== INFO_ADICIONAL ========
         m = re.search(
             r'''
-            \[\s*(?:informaci[oó]n\s+adicional|adicional|detalles\s+adicionales)\s*\]\s*:?\s*
+            \[\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]\s*:?\s*
             (.*?)                                    # contenido
             \s*
-            \[\s*/\s*(?:informaci[oó]n\s+adicional|adicional|detalles\s+adicionales)\s*\]
+            \[\s*/\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]
             ''',
             full_answer_norm, flags=re.IGNORECASE | re.DOTALL | re.UNICODE | re.VERBOSE
         )
@@ -1098,12 +1178,12 @@ def lambda_handler(event, context):
         else:
             m = re.search(
                 r'''
-                \[\s*(?:informaci[oó]n\s+adicional|adicional|detalles\s+adicionales)\s*\]\s*:?\s*
+                \[\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]\s*:?\s*
                 (.*?)                                 # contenido
                 \s*
                 (?=
-                    </\s*adicional\s*>
-                    | \[/\s*adicional\s*\]
+                    </\s*(?:adicional|adicial)\s*>       # </ADICIONAL> o </ADICIAL>
+                    | \[/\s*(?:adicional|adicial)\s*\]   # [/ADICIONAL] o [/ADICIAL]
                     | $
                 )
                 ''',
@@ -1115,18 +1195,22 @@ def lambda_handler(event, context):
                 m2 = re.search(r'\[\s*([^\[\]]+?)\s*\]', full_answer_norm, flags=re.DOTALL | re.UNICODE)
                 if m2:
                     candidate = m2.group(1).strip()
-                    if not re.fullmatch(r'(?:informaci[oó]n\s+adicional|adicional|detalles\s+adicionales)', candidate, flags=re.IGNORECASE):
+                    if not re.fullmatch(
+                        r'(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)',
+                        candidate,
+                        flags=re.IGNORECASE
+                    ):
                         info_adicional = candidate
 
-        # ======== RECUPERACIÓN PARA CASO MALFORMADO: <RESUMEN> ... [/ADICIONAL] ... ========
+        # ======== RECUPERACIÓN PARA CASO MALFORMADO: <RESPUESTA> ... [/ADICIONAL] ... ========
         try:
-            closing_add_re = r'\[/\s*(?:informaci[oó]n\s+adicional|adicional|detalles\s+adicionales)\s*\]'
-            opening_res_re = r'<\s*RESUMEN\s*>'
+            closing_add_re = r'\[/\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]'
+            opening_res_re = r'<\s*(?:RESPUESTA|RESPUEDA|RESPUESE|RESPUEDE)\s*>'
 
             if not info_adicional:
                 text = full_answer_norm or ""
 
-                # Caso A: el RESUMEN quedó con un [/ADICIONAL] dentro (contaminado)
+                # Caso A: el RESPUESTA/RESPUEDA/RESPUESE/RESPUEDE quedó con un [/ADICIONAL] o [/ADICIAL] dentro (contaminado)
                 if resumen and re.search(closing_add_re, resumen, flags=re.IGNORECASE):
                     parts = re.split(closing_add_re, resumen, maxsplit=1, flags=re.IGNORECASE)
                     resumen = (parts[0] or "").strip()
@@ -1138,17 +1222,17 @@ def lambda_handler(event, context):
                     if tail:
                         info_adicional = tail
 
-                # Caso B: existe <RESUMEN> en el texto y uno o más cierres [/ADICIONAL] sin apertura
+                # Caso B: existe <RESPUESTA/RESPUEDA/RESPUESE/RESPUEDE> y uno o más cierres [/ADICIONAL] o [/ADICIAL] sin apertura
                 if not info_adicional and re.search(opening_res_re, text, flags=re.IGNORECASE) and re.search(closing_add_re, text, flags=re.IGNORECASE):
                     after_resumen = re.split(opening_res_re, text, maxsplit=1, flags=re.IGNORECASE)[1]
                     before_close, *rest = re.split(closing_add_re, after_resumen, maxsplit=1, flags=re.IGNORECASE)
                     cand_resumen = (before_close or "").strip()
                     cand_tail = (rest[0] if rest else "").strip()
 
-                    # Limpiar un posible segundo [/ADICIONAL] al final del tail
+                    # Limpiar un posible segundo cierre al final del tail
                     cand_tail = re.sub(closing_add_re + r'\s*$', "", cand_tail, flags=re.IGNORECASE).strip()
 
-                    if cand_resumen and (not resumen or resumen.upper() == "RESUMEN"):
+                    if cand_resumen and (not resumen or resumen.upper() in ("RESPUESTA", "RESPUEDA", "RESPUESE", "RESPUEDE")):
                         resumen = cand_resumen
                     if cand_tail:
                         info_adicional = cand_tail
@@ -1165,6 +1249,7 @@ def lambda_handler(event, context):
         except Exception:
             # Falla silenciosa
             pass
+        # print(f"----------INICIO - PARSEAR RESUMEN Y INFO ADICIONAL----------")
 
         # Limpieza Resumen
         resumen = remove_according_phrases(resumen)
@@ -1248,12 +1333,12 @@ def lambda_handler(event, context):
                 "category": category or 'Sin categoría',
                 "raw_message": resumen.replace("\n", "<br>"),
                 "raw_additional": raw_additional or 'ERROR_GENERATION',
-                "raw_additional_clean": raw_additional_clean.replace("\n", "") or 'Intermitencia de Servicio.',
-                "fragments_used": texto_unico,
+                "raw_additional_clean": raw_additional_clean.replace("\n", "") or 'No encontrado en Información.',
+                "fragments_used": articulo,
                 "session_id": session_id,
-                "rag_files": 'rag_files',
+                "rag_files": rag_files,
                 "links": links,
-                "metadata": metadata_list
+                "metadata": metadata_response
             },
             "total_execution_time": total_time
         }
@@ -1263,7 +1348,7 @@ def lambda_handler(event, context):
         mark(execution_times, "buildResponse", t10)
 
     else:
-        resumen = full_answer
+        resumen = full_answer  # por ejemplo
         raw_additional = full_answer
         raw_additional_clean = full_answer
         category = category or 'Sin categoría'
@@ -1278,12 +1363,12 @@ def lambda_handler(event, context):
                 "rephrased_message": rephrased,
                 "kbid": KB_ID,
                 "category": category,
-                "raw_message": resumen.replace("\n", "<br>") if resumen else 'Intermitencia de Servicio.',
+                "raw_message": resumen.replace("\n", "<br>") if resumen else 'No encontrado en Información.',
                 "raw_additional": raw_additional or 'ERROR_GENERATION',
-                "raw_additional_clean": raw_additional_clean.replace("\n", "") if raw_additional_clean else 'Intermitencia de Servicio.',
-                "fragments_used": texto_unico,
+                "raw_additional_clean": raw_additional_clean.replace("\n", "") if raw_additional_clean else 'No encontrado en Información.',
+                "fragments_used": context_text,
                 "session_id": session_id,
-                "rag_files": 'rag_files',
+                "rag_files": rag_files,
                 "links": links,
                 "metadata": metadata_list
             },
