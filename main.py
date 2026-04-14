@@ -6,15 +6,16 @@ import threading
 import base64
 import uuid
 import logging
+import ast
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 from decimal import Decimal
 from time import perf_counter
-from typing import Any, Mapping, Tuple, Optional
+from typing import Any, Mapping, Dict, List, Tuple, Optional
 from urllib.parse import urlparse, urlunparse
-
+from html import escape
 import boto3
 import concurrent.futures
 import requests
@@ -28,6 +29,13 @@ from botocore.exceptions import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+_RE_COMILLAS = re.compile(r'(["“])(.+?)(["”])')   # "texto" o “texto”
+_RE_NEGRITA  = re.compile(r'\*\*(.+?)\*\*')       # **texto**
+REASONING_BLOCK_RE = re.compile(
+    r'<\s*reasoning\b[^>]*>(.*?)</\s*reasoning\s*>',
+    flags=re.IGNORECASE | re.DOTALL
+)
 
 
 def _configure_logging(level: str) -> None:
@@ -85,6 +93,7 @@ class Config:
     sonnet_model_id: str
     sonnet_37_model_id: str
     sonnet_4_model_id: str
+    sonnet_45_model_id: str
     titan_premier_model_id: str
     titan_express_model_id: str
     gpt_oss_120_model_id: str
@@ -114,6 +123,7 @@ def load_config() -> Config:
         sonnet_model_id=_require_env("SONNET_MODEL_ID"),
         sonnet_37_model_id=_require_env("SONNET_37_MODEL_ID"),
         sonnet_4_model_id=_require_env("SONNET_4_MODEL_ID"),
+        sonnet_45_model_id=_require_env("SONNET_45_MODEL_ID"),
         titan_premier_model_id=_require_env("TITAN_PREMIER_MODEL_ID"),
         titan_express_model_id=_require_env("TITAN_EXPRESS_MODEL_ID"),
         gpt_oss_120_model_id=_require_env("GPT_OSS_120_MODEL_ID"),
@@ -124,7 +134,7 @@ def load_config() -> Config:
         anthropic_version=os.environ.get("ANTHROPIC_VERSION", "bedrock-2023-05-31"),
         categories=os.environ.get("CATEGORIES", "").split(","),
         include_exec_times=_get_bool_env("INCLUDE_EXEC_TIMES", True),
-        kb_max_results=_get_int_env("KB_MAX_RESULTS", 10),
+        kb_max_results=_get_int_env("KB_MAX_RESULTS", 9),
         kb_search_type=os.environ.get("KB_SEARCH_TYPE", "HYBRID"),
         s3_files_prefix=os.environ.get("S3_FILES_PREFIX", "s3://files-cda/"),
         invoke_timeout_seconds=_get_float_env("INVOKE_TIMEOUT_SECONDS", 27.5),
@@ -160,6 +170,7 @@ HAIKU_45_MODEL_ID = CONFIG.haiku_45_model_id
 SONNET_MODEL_ID = CONFIG.sonnet_model_id
 SONNET_37_MODEL_ID = CONFIG.sonnet_37_model_id
 SONNET_4_MODEL_ID = CONFIG.sonnet_4_model_id
+SONNET_45_MODEL_ID = CONFIG.sonnet_45_model_id
 TITAN_PREMIER_MODEL_ID = CONFIG.titan_premier_model_id
 TITAN_EXPRESS_MODEL_ID = CONFIG.titan_express_model_id
 GPT_OSS_120_MODEL_ID = CONFIG.gpt_oss_120_model_id
@@ -187,6 +198,8 @@ conversations_table = dynamo.Table(CONV_TABLE_NAME)
 questions_table     = dynamo.Table(QUESTIONS_TABLE_NAME)
 
 ## MENSAJES PROTOTIPOS
+MIN_VALID_CHARS = 50
+S3_PREFIX = "s3://files-cda/contenido_dependencias"
 error_msg = "Error"
 
 _S3_RE = re.compile(
@@ -294,7 +307,7 @@ def _invoke_chat(model_id, prompt_text, max_tokens, temperature, top_p=None, sto
 
     GLOSARIO:
     - Ancillaries = servicios adicionales / servicios complementarios.
-    - EMD (Electronic Miscellaneous Document) = Documento electrónico usado para cobrar servicios adicionales (ancillaries). No es interlineal ni endosable. Puede ser asociado a un pasaje (EMD-A) o stand-alone (EMD-S). Validez: 1 año; personal e intransferible. Su uso depende estrictamente del servicio para el cual fue emitido. Los EMD-A se sincronizan con los cupones del pasaje; cambios en itinerario o pasaje rompen la sincronización y requieren reemisión. Ancillaries vendidos junto al pasaje se emiten desde Agente360; servicios especiales y ventas independientes se gestionan en herramientas backup como Allegro. Para ventas indirectas, consultar “EMD – Atención Agencias de Viajes LATAM”.
+    - EMD (Electronic Miscellaneous Document) = Documento electrónico usado para cobrar servicios adicionales (ancillaries). No es interlineal ni endosable. Puede ser asociado a un pasaje (EMD-A) o stand-alone (EMD-S). Validez: 1 año; personal e intransferible. Su uso depende estrictamente del servicio para el cual fue emitido. Los EMD-A se sincronizan con los cupones del pasaje; cambios en itinerario o pasaje rompen la sincronización y requieren reemisión. Ancillaries vendidos junto al pasaje se emiten desde Agente360; servicios especiales y ventas independientes se gestionan en herramientas backup como Allegro. Para ventas indirectas, consultar  'EMD – Atención Agencias de Viajes LATAM '.
 
     Tu objetivo: realizar lo que se te pida de forma impecablemente profesional, siguiendo políticas LATAM, manteniendo contexto operativo y evitando inferencias no respaldadas por normativa interna.
     """
@@ -442,8 +455,8 @@ def _invoke_chat_with_timeout(
 ):
     """
     Envuelve _invoke_chat con un timeout duro.
-    - Si el modelo responde antes del timeout → devuelve (respuesta, False)
-    - Si se pasa del timeout → devuelve ("Intermitencia de Servicio", True)
+    - Si el modelo responde antes del timeout -  devuelve (respuesta, False)
+    - Si se pasa del timeout -  devuelve ("Intermitencia de Servicio", True)
     """
     result = {"value": None}
     error = {"exc": None}
@@ -586,6 +599,9 @@ def merge_results(question_chunks, rephrased_chunks):
         "doc_id": None,
         "title": None,
         "description": None,
+        "topics": None,
+        "not_covered": None,
+        "intents": None,
         "idioma": None,
         "from_original": None,
         "from_rephrased": None,
@@ -597,8 +613,14 @@ def merge_results(question_chunks, rephrased_chunks):
         d["doc_id"] = item["doc_id"]
         if item.get("title") is not None:
             d["title"] = item["title"]
-        if item.get("description") is not None:
-            d["description"] = item["description"]
+        if item.get("context_short") is not None:
+            d["description"] = item["context_short"]
+        if item.get("context_bullets") is not None:
+            d["topics"] = item["context_bullets"]
+        if item.get("not_covered") is not None:
+            d["not_covered"] = item["not_covered"]
+        if item.get("intents") is not None:
+            d["intents"] = item["intents"]
         if item.get("idioma") is not None:
             d["idioma"] = item["idioma"]
         d["from_original"] = {
@@ -613,8 +635,14 @@ def merge_results(question_chunks, rephrased_chunks):
         d["doc_id"] = item["doc_id"]
         if item.get("title") is not None and d["title"] is None:
             d["title"] = item["title"]
-        if item.get("description") is not None and d["description"] is None:
-            d["description"] = item["description"]
+        if item.get("context_short") is not None and d["context_short"] is None:
+            d["description"] = item["context_short"]
+        if item.get("context_bullets") is not None:
+            d["topics"] = item["context_bullets"]
+        if item.get("not_covered") is not None:
+            d["not_covered"] = item["not_covered"]
+        if item.get("intents") is not None:
+            d["intents"] = item["intents"]
         if item.get("idioma") is not None and d["idioma"] is None:
             d["idioma"] = item["idioma"]
         d["from_rephrased"] = {
@@ -625,6 +653,16 @@ def merge_results(question_chunks, rephrased_chunks):
             d["doc"] = item
 
     return list(merged.values())
+
+def formatear_texto(texto: str) -> str:
+    # 1) Comillas dobles (ASCII o tipográficas) -> negrita + cursiva
+    #    Usamos grupo 2: el contenido dentro de las comillas
+    texto = _RE_COMILLAS.sub(r'<b><i>\2</i></b>', texto)
+
+    # 2) Doble asterisco -> negrita
+    texto = _RE_NEGRITA.sub(r'<b>\1</b>', texto)
+
+    return texto
 
 def pick_by_heuristics(
     merged_docs,
@@ -667,7 +705,7 @@ def pick_by_heuristics(
     # devolvemos el doc normalizado que tiene el "raw"
     return best_merged.get("doc") or best_merged
 
-def build_llm_candidates_payload(merged_docs, max_candidates=5):
+def build_llm_candidates_payload(merged_docs, max_candidates=9):
     # Ordenar por mejor score (tomando el mejor de original/rephrased)
     def best_score(d):
         scores = []
@@ -733,6 +771,85 @@ def normalizar_links(lista_links):
     # Convertir de nuevo a lista ordenada
     return sorted(urls_limpias)
 
+def parsear_link_y_titulo(valor: Any) -> Dict[str, str]:
+    """
+    Acepta:
+      - 'https://...;Flujo XYZ'
+      - 'https://...'
+    y devuelve:
+      {'url': 'https://...', 'title': 'Flujo XYZ'}
+    """
+    if not isinstance(valor, str):
+        return {"url": "", "title": ""}
+
+    texto = valor.strip().strip('"').strip("'")
+    if not texto:
+        return {"url": "", "title": ""}
+
+    if ";" in texto:
+        url, titulo = texto.split(";", 1)
+        return {
+            "url": url.strip(),
+            "title": titulo.strip() or "Sin Titulo",
+        }
+
+    return {
+        "url": texto,
+        "title": "Sin Titulo",
+    }
+
+
+def normalizar_url(url: str) -> str:
+    """
+    Normaliza pequeñas variaciones de una URL:
+    - trim
+    - minúsculas en scheme y netloc
+    - quita slash final del path
+    - conserva query string
+    - elimina fragment
+    """
+    if not isinstance(url, str):
+        return ""
+
+    url = url.strip().strip('"').strip("'")
+    if not url:
+        return ""
+
+    parsed = urlparse(url)
+
+    scheme = (parsed.scheme or "https").lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path.rstrip("/") if parsed.path not in ("", "/") else parsed.path
+
+    return urlunparse((scheme, netloc, path, "", parsed.query, ""))
+
+
+def convertir_links_a_html(links):
+    # Si viene como string con formato de lista, lo convertimos a lista real
+    if isinstance(links, str):
+        links = ast.literal_eval(links)
+
+    resultado = []
+
+    for item in links:
+        if ';' not in item:
+            continue  # omite elementos mal formateados
+
+        url, titulo = item.split(';', 1)  # separa solo en el primer ;
+        url = url.strip()
+        titulo = titulo.strip()
+
+        html_link = (
+            f'<a href="{escape(url, quote=True)}" '
+            f'target="_blank" rel="noopener noreferrer">'
+            f'{escape(titulo)}'
+            f'</a>'
+        )
+
+        resultado.append(html_link)
+
+    return resultado
+
 def normalize_s3_uri(u: str) -> str:
     if not isinstance(u, str):
         return ""
@@ -765,6 +882,36 @@ def fetch_s3_text(uri: str) -> str:
     resp.raise_for_status()
     return resp.text
 
+def normalize_text(raw_txt: str) -> str:
+    return re.sub(r"\s+", " ", raw_txt.replace("\n", " ")).strip()
+
+
+def is_valid_text(raw_txt: str, min_chars: int = MIN_VALID_CHARS) -> bool:
+    if not raw_txt:
+        return False
+    txt = normalize_text(raw_txt)
+    return len(txt) >= min_chars
+
+
+def fetch_with_fallback(uri: str, prefix: str = S3_PREFIX, min_chars: int = MIN_VALID_CHARS):
+    candidates = [prefix + uri, uri]
+    errors = []
+
+    for candidate in candidates:
+        try:
+            raw_txt = fetch_s3_text(candidate)
+            print("len dependencia: ",len(raw_txt))
+            if is_valid_text(raw_txt, min_chars=min_chars):
+                print("candidato valido: ",candidate)
+                return raw_txt, candidate
+
+            errors.append(f"Contenido inválido o demasiado corto en: {candidate}")
+
+        except Exception as e:
+            errors.append(f"Error en {candidate}: {e}")
+
+    raise ValueError("No se encontró contenido válido. " + " | ".join(errors))
+
 def end_tag_for_uri(uri: str, fallback_kind: str) -> str:
     """Devuelve el tag de cierre en función de la extensión."""
     ext = uri.lower().rsplit('.', 1)[-1] if '.' in uri else ''
@@ -786,6 +933,29 @@ def remove_reasoning_blocks(text: str) -> str:
 
     # 3) Limpieza de comillas envolventes accidentales y espacios
     return text.strip().strip('"').strip("'").strip()
+
+def split_reasoning_blocks(text: str) -> Tuple[str, List[str]]:
+    # 1) Extraer el contenido interno de todos los bloques <reasoning>...</reasoning>
+    reasoning_blocks = [
+        match.group(1).strip()
+        for match in REASONING_BLOCK_RE.finditer(text)
+    ]
+
+    # 2) Remover esos bloques del texto original
+    clean_text = REASONING_BLOCK_RE.sub('', text)
+
+    # 3) Por si llegan tags sueltos sin pareja
+    clean_text = re.sub(
+        r'</?\s*reasoning\b[^>]*>',
+        '',
+        clean_text,
+        flags=re.IGNORECASE
+    )
+
+    # 4) Limpieza final
+    clean_text = clean_text.strip().strip('"').strip("'").strip()
+
+    return clean_text, reasoning_blocks
 
 def remove_according_phrases(text: str) -> str:
     frases = [
@@ -820,6 +990,22 @@ def remove_according_phrases(text: str) -> str:
     text = re.sub(r"\s+([,.:;])", r"\1", text)
 
     return text
+
+	
+def fetch_first_valid_text(uri: str, min_chars: int = MIN_VALID_CHARS):
+    candidates = [
+        f"{S3_PREFIX}{uri}",
+        uri,
+    ]
+    last_error = None
+    for candidate in candidates:
+        try:
+            raw_txt = fetch_s3_text(candidate)
+            if is_valid_text(raw_txt, min_chars=min_chars):
+                return candidate, raw_txt
+        except Exception as e:
+            last_error = e
+    return None, None
 
 def remove_resumen_tag(text: str) -> str:
     return re.sub(r'\[\s*/\s*RESUMEN\s*\]', '', text, flags=re.IGNORECASE)
@@ -914,11 +1100,103 @@ def format_to_html(raw_text: str) -> str:
     return "\n".join(html_parts)
 
 def format_resumen(resumen: str) -> str:
-    resumen = resumen.replace(". ", ".\n")
-    resumen = resumen.replace("\n", "<br><br>")
-    resumen_formateado = f"<p>{resumen}</p>"
+    if not resumen:
+        return ""
+
+    text = resumen.strip()
+
+    # Paso 1: Convertir negritas Markdown a HTML
+    text = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", text)
+
     
-    return resumen_formateado
+
+    # Paso 2: Normalizar listas numeradas en línea
+
+    text = re.sub(
+        r'(?<!\n)(?:;\s*|\s+)(\d+[.)]\s)',
+        r'\n\1',
+        text
+    )
+
+    # Normalizar listas numeradas en línea
+    text = re.sub(
+        r'(?<!\n)(?:;\s*|\s+)(\(\d+\)\s)',
+         r'\n\1',
+        text
+    )
+
+    # Normalizar bullet points en línea: ". - Texto" → salto + "- Texto 
+    text = re.sub(
+        r'(?<=[.:])\s+-\s+',
+        r'\n- ',
+        text
+    )
+
+    # Paso 3: Separar en bloques por doble salto de línea
+    blocks = re.split(r"\n\s*\n", text)
+
+    html_parts = []
+
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+
+        # Paso 4: Detectar lista numerada
+        has_numbered = re.search(r"(?m)^\s*(?:\d+[.)]\s|\(\d+\)\s)", block) is not None
+
+        if has_numbered:
+            intro_match = re.match(r"^(.*?)(?=\s*(?:\d+[.)]\s|\(\d+\)\s))", block, re.DOTALL)
+            if intro_match:
+                intro = intro_match.group(1).strip()
+                if intro:
+                    html_parts.append(f"{intro}<br>")
+
+            items = re.findall(
+                r"(?ms)(?:\d+[.)]|\(\d+\))\s*(.+?)(?=(?:(?:\d+[.)]|\(\d+\))\s)|\Z)",
+                block
+            )
+
+            if items:
+                html_parts.append("<ol>")
+                for item in items:
+                    item = item.strip()
+                    item = re.sub(r";\s*$", "", item)
+                    if item:
+                        html_parts.append(f"<li>{item}</li>")
+                html_parts.append("</ol>")
+
+        # Paso 5: Detectar bullet points
+        elif re.search(r"(?m)^\s*[-•]\s+", block):
+            lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+
+            intro_lines = []
+            bullet_start = 0
+            for i, ln in enumerate(lines):
+                if re.match(r"^[-•]\s+", ln):
+                    bullet_start = i
+                    break
+                intro_lines.append(ln)
+
+            if intro_lines:
+                html_parts.append(f"{' '.join(intro_lines)}<br>")
+
+            html_parts.append("<ul>")
+            for ln in lines[bullet_start:]:
+                m = re.match(r"^[-•]\s+(.*)", ln)
+                if m:
+                    html_parts.append(f"<li>{m.group(1).strip()}</li>")
+                else:
+                    html_parts.append(f"<li>{ln}</li>")
+            html_parts.append("</ul>")
+
+        else:
+            # Paso 6: Párrafo normal
+            lines = block.splitlines()
+            paragraph = "<br>".join(ln.strip() for ln in lines if ln.strip())
+            html_parts.append(f"<p>{paragraph}</p>")
+
+    return "\n".join(html_parts)
 
 def convertir_links_html(resumen: str) -> str:
     patron_url = re.compile(
@@ -967,6 +1245,10 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     print(f"ID DE INTERACCIÓN: ",session_id)
     language = (data or {}).get('language')
     print(f"IDIOMA: ",language)
+    name = (data or {}).get('name')
+    print(f"NOMBRE AGENTE: ",name)
+    email = (data or {}).get('email')
+    print(f"EMAIL: ",email)
 
     if not question:
         print("No 'question' in body")
@@ -997,13 +1279,17 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     rephrase_prompt = (
         "Contexto:\n"
         + "\n".join(rephrase_context)
-        + "\n\nReformula la consulta anterior en una sola pregunta. "
-        f"En IDIOMA: {language}."
-        "Devuelve SOLO la pregunta reformulada.\n\n"
-        "Pregunta reformulada:"
+        + "\n\nCorrige la ortografía y puntuación de la consulta anterior (tildes, comas y signos de interrogación) para formar una sola pregunta clara.\n\n"
+        "Reglas estrictas:\n"
+        "- Conserva EXACTAMENTE el mismo vocabulario y términos de la consulta original.\n"
+        "- NO uses sinónimos ni reemplaces palabras.\n"
+        "- NO agregues información adicional ni contexto extra.\n"
+        f"- En IDIOMA: {language}.\n"
+        "- Devuelve SOLO la pregunta corregida, sin comillas ni texto introductorio.\n\n"
+        "Pregunta corregida:"
     )
     try:
-        rephrased = _invoke_chat(HAIKU_MODEL_ID, rephrase_prompt, max_tokens=90, temperature=0.0).strip() or question
+        rephrased = _invoke_chat(HAIKU_MODEL_ID, rephrase_prompt, max_tokens=80, temperature=0.0).strip() or question
     except Exception:
         rephrased = question
 
@@ -1044,7 +1330,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     consensus_doc = same_top_doc(
         question_chunks,
         rephrased_chunks,
-        min_score=0.53,
+        min_score=0.81,
         debug=False
     )
     if consensus_doc:
@@ -1054,39 +1340,96 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         merged_docs = merge_results(question_chunks, rephrased_chunks)
         heuristic_doc = pick_by_heuristics(
             merged_docs,
-            min_avg_score=0.69,
+            min_avg_score=0.79,
             max_rank_allowed=2,
-            debug=True
+            debug=False
         )
         if heuristic_doc:
             selected_doc = heuristic_doc
             print("SELECCIÓN HEURISTICA")
         else:
-            candidate_docs = build_llm_candidates_payload(merged_docs, max_candidates=6)
+            candidate_docs = build_llm_candidates_payload(merged_docs, max_candidates=7)
             docs_text = ""
+            print(candidate_docs)
             for d in candidate_docs:
+
                 raw_doc = (d.get("doc") or {}).get("raw", {})
+                md_doc = (raw_doc.get("doc") or {}).get("metadata", {})
+
+                description = (raw_doc.get("metadata") or {}).get("context_short", "No hay 'context_short'")
+                topics = (raw_doc.get("metadata") or {}).get("context_bullets", "No hay 'context_bullets'")
+                topics_str = str(topics)
                 full_text = raw_doc.get("content", {}).get("text", "")
-                sample = (full_text[:750] + "...") if len(full_text) > 750 else full_text
+                sample = (full_text[:9900] + "...") if len(full_text) > 9900 else full_text
+                not_covered = (raw_doc.get("metadata") or {}).get("not_covered", "No hay 'not_covered'")
+                intents = (raw_doc.get("metadata") or {}).get("intents", "No hay 'intents'")
+
                 docs_text += (
                     f"Documento {d['id']}:\n"
-                    f"  id: {d['id']}\n"
-                    f"  título: {d['title']}\n"
-                    f"  descripción: {d['description']}\n"
-                    f"  sample:\n{sample}\n\n"
+                    f"  -id: {d['id']}\n"
+                    f"  -titulo: {d['title']}\n"
+                    f"  -descripción: {description}\n"
+                    f"  -sample:\n{sample}.\n\n"
+                    f"  -topicos: {topics_str}\n"
+                    f"  -topicos no cubiertos (excluyente): {not_covered}\n"
+                    f"  -intents: {intents}\n"
                 )
 
             print("docs_txt_ia: ",docs_text)
             prompt_chunks = (
-                f"Tu tarea es LEER atentamente la pregunta del usuario y las descripciones de los artículos, y escoger un único artículo que mejor responda a la pregunta.\n"
-                f"Responde ÚNICAMENTE con el id del archivo que mejor responde la pregunta.\n"
-                f"Pregunta original:\n{question}\n\n"
-                f"Pregunta parafraseada:\n{rephrased}\n\n"
-                f"A continuación tienes los posibles artículos candidatos, con título, descripción:\n"
-                f"\n{docs_text}\n\n"
-                f"Responde ÚNICAMENTE con el id del documento que consideres más relevante (campo 'id'), sin ningún texto adicional, explicación ni formato extra.\n\n"
+                "Eres un sistema de selección de documentos (retrieval re-ranking).\n"
+                "Tu tarea es elegir EXACTAMENTE 1 documento candidato que mejor responda la pregunta del usuario.\n\n"
+
+                "REGLAS DE SALIDA (OBLIGATORIAS):\n"
+                "1) Debes responder ÚNICAMENTE con el valor del campo 'id' del documento elegido.\n"
+                "2) No incluyas ningún texto adicional: sin explicación, sin comillas, sin markdown, sin prefijos ('id:'), sin saltos extra.\n"
+
+                "CÓMO DECIDIR (CRITERIOS):\n"
+                "- Prioriza el documento que cubra MÁS directamente la pregunta.\n"
+                "- Usa 'title' y 'description' y 'topics' para entender el tema general y el objetivo del documento.\n"
+                "- Usa'sample' solo como ejemplo: es el primer fragmento del documento, no es el documento entero.\n"
+                "- Revisa 'not covered' para DESCARTAR documentos que explícitamente no traten partes clave de la pregunta.\n\n"
+
+                "HARD CONSTRAINTS (OBLIGATORIAS / PENALIZACIÓN MUY FUERTE SI NO SE CUMPLEN):\n"
+                "0) Si la pregunta contiene un código/SSR o acrónimo específico (ej: 'MAAS', 'INCU', 'WCHR'), SOLO son elegibles documentos donde ese código aparezca literalmente en title/description/topics/sample, o un sinónimo directo inequívoco (ej: MAAS = 'máxima asistencia').\n"
+                "1) Restricciones explícitas del enunciado: si la pregunta menciona un canal, herramienta, sistema, país, producto, o tipo de caso específico, esa mención debe aparecer (o estar claramente implicada) en 'title'/'description'/'topics'/'sample'.\n"
+                "   - Ejemplos de canal: 'email/correo', 'WhatsApp', 'Chat', 'teléfono/voz'.\n"
+                "   - Ejemplos de herramienta/sistema: 'backup tools', 'Sabre', 'Allegro', 'Agente 360', etc.\n"
+                "2) Si la pregunta exige un canal concreto (p.ej., 'por email'), penaliza fuerte documentos cuyo foco sea otro canal (p.ej., WhatsApp/Chat/voz) y NO mencionen el canal solicitado.\n"
+                "3) Si la pregunta incluye 2 o más condiciones (p.ej., 'excepción grave' + 'herramientas backup' + 'email' + 'tipificación'), gana el documento que cumpla MÁS condiciones simultáneamente, aunque otro documento sea muy fuerte en solo una de ellas.\n"
+                "4) Si 'not covered' declara que NO cubre una restricción explícita (p.ej., 'no email' o 'no backup tools' o 'no tipificación'), descártalo o penalízalo al máximo.\n\n"
+                "5) Si la pregunta menciona explícitamente una normativa/mercado/rol o sigla operativa (ej: 'Código de Consumo PE', 'PE/Perú', 'no show', 'LUA', 'HVC'), SOLO son elegibles documentos que mencionen literalmente esa misma normativa/mercado/rol/sigla en 'title'/'description'/'topics'/'sample' (o una variante obvia: 'Perú' para 'PE').\n"
+                "   - Si un documento NO menciona esas señales, aplícale penalización máxima (casi descarte), aunque sea relevante de forma general.\n"
+                "   - EXCEPCIÓN: si NINGÚN documento menciona esas señales, entonces elige el más cercano por intención (p.ej. 'no show' -> cambios post-salida; 'Código de Consumo' -> políticas/excepciones de mercado) y con menor conflicto en 'not covered'.\n\n"
+                "6) Si la pregunta contiene “Staff travel” o “consola”, sólo son elegibles docs que mencionen “Staff travel” o el sistema/consola correspondiente, si no menciona: recién ahí caer al más cercano.\n\n"
+
+                "HEURÍSTICA DE SELECCIÓN (rápida pero estricta):\n"
+                "A) Si un documento parece responder la pregunta y además su 'not covered' NO contradice esa necesidad, es fuerte candidato.\n"
+                "B) Si 'not covered' menciona explícitamente el tema preguntado (o una parte esencial), penalízalo fuerte.\n"
+                "C) Si varios parecen relevantes, elige el que tenga señales más claras en 'description' + 'topics'.\n"
+                "D) Si ninguno responde perfectamente, elige el MÁS cercano (mejor cobertura parcial) y con menor conflicto en 'not covered'.\n\n"
+
+                "IMPORTANTE:\n"
+                "- No inventes información: decide SOLO con lo que aparece en los candidatos.\n"
+                "- Debes escoger un único id documento incluso si la cobertura es parcial.\n\n"
+
+                f"PREGUNTA DEL USUARIO:\n{question}\n\n"
+                "DOCUMENTOS CANDIDATOS (formato fijo):\n"
+                "Cada candidato aparece como:\n"
+                "Documento X:\n"
+                "  -id: <id>\n"
+                "  -title: <title>\n"
+                "  -description: <description>\n"
+                "  -topics: <topics>\n"
+                "  -sample:\n"
+                "    <sample>\n"
+                "  -not covered: <not_covered>\n\n"
+                "  -intents: <not_covered>\n"
+                f"{docs_text}\n\n"
+
+                "RESPUESTA (SOLO EL id DEL DOCUMENTO ELEGIDO):"
             )
-            chosen_id = _invoke_chat(HAIKU_MODEL_ID, prompt_chunks, max_tokens=10, temperature=0.0).strip()
+            chosen_id = _invoke_chat(SONNET_45_MODEL_ID, prompt_chunks, max_tokens=10, temperature=0.0).strip()
             print("CHOSEN ID - IA: ", chosen_id)
             
             chosen_candidate = next((c for c in candidate_docs if c["id"] == chosen_id), None)
@@ -1094,12 +1437,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
             if not chosen_candidate:
                 print("No se encontró candidato para ese id, fallback a primero")
                 chosen_candidate = candidate_docs[0]
-
-            # if chosen_id is '1':
-            #     selected_doc_aux = candidate_docs[1]      ##SEGUNDO:candidate_docs[1]
-            # else:
-            #     selected_doc_aux = candidate_docs[0]
-
+                
             selected_doc = chosen_candidate["doc"]
             print("SELECCIÓN IA")
 
@@ -1113,6 +1451,8 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     print("***********************************************************")
     t5 = tstart()
     print(f"----------INICIO - INYECCIÓN DEPENDENCIAS----------")
+    title_to_show = selected_doc.get("title", "Título no encontrado")
+    print("Title to show: ",title_to_show)
     raw = selected_doc.get("raw", {})  # chunk original de Bedrock
 
     rag_files = (
@@ -1121,19 +1461,22 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         .get('uri', '')
         .replace(CONFIG.s3_files_prefix, '')
     )
+    print("rg:",rag_files)
 
     sel_text = (
         raw.get('content', {})
         .get('text', '')
-        .replace('\r', '')
     )
-    print("LEN articulo antes de dependencias: ",len(sel_text))
-    print(sel_text)
 
     meta = raw.get('metadata', {})
+
     uris = meta.get('tablas', []) + meta.get('flujos', [])
+
+    glosario_uris = meta.get('glosario', [])
+
     links = meta.get('urls', [])
     links = normalizar_links(links)
+    links = convertir_links_a_html(links)
 
     metadata_response = {
         "tablas": meta.get("tablas", []),
@@ -1141,14 +1484,39 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     }
     
     metadata_list = []
+
     for uri in uris:
         try:
-            raw_txt = fetch_s3_text(uri)
-            txt = re.sub(r'\s+', ' ', raw_txt.replace('\n', ' '))
-            print("len flujo: ",len(txt))
-            metadata_list.append({"uri": uri, "content": txt})
-        except Exception as e:
-            metadata_list.append({"uri": uri, "content": error_msg})
+            raw_txt, used_uri = fetch_with_fallback(uri)
+            txt = normalize_text(raw_txt)
+
+            metadata_list.append({
+                "uri": used_uri,
+                "content": txt
+            })
+
+        except Exception:
+            metadata_list.append({
+                "uri": uri,
+                "content": "No encontrado: " + uri
+            })
+            continue
+
+    print("Metadata List: ",metadata_list)
+
+    glosario_str = ""
+
+    for uri in glosario_uris:
+        try:
+            raw_txt, used_uri = fetch_with_fallback(uri)
+            txt = normalize_text(raw_txt)
+            glosario_str += txt + "\n"
+
+        except Exception:
+            glosario_str += f"No encontre contenido en glosario: {uri}\n"
+            continue
+    
+    print("Glosario",glosario_str)
 
     # --- Construye un mapa uri -> contenido (URIs normalizadas) ---
     uri_to_content = {
@@ -1162,6 +1530,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         r'\[(TABLA|FLUJO)\]([\s\S]*?)(s3://.*?\.(?:csv|txt|json))',
         flags=re.IGNORECASE | re.UNICODE
     )
+    print("Sel_text articulo:",sel_text)
 
     def replace_match(m: re.Match) -> str:
         kind = m.group(1).upper()
@@ -1178,9 +1547,8 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         return f'[{kind}]{middle}{{ {content} }} [{fin_tag}]'
 
     context_text = pattern.sub(replace_match, sel_text)
-    print("largo len despues de inyeccion dependencias:")
-    print(len(context_text))
-    print(context_text)
+
+    context_text = "Glosario: "+glosario_str + "Articulo: "+context_text
 
     mark(execution_times, 'loadChunk', t5)
     print(f"----------FIN - INYECCIÓN DEPENDENCIAS----------")
@@ -1188,7 +1556,9 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     t6 = tstart()
     print(f"----------INICIO - GENERAR RESPUESTA----------")
     articulo = context_text
+    
     print("LEN ARTICULO: ",len(articulo))
+    print(articulo)
 
     answer_prompt = (
         "INSTRUCCIONES ESTRICTAS (SEGUIR AL PIE DE LA LETRA):\n"
@@ -1209,7 +1579,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         "   — Si la información es PARCIAL, responde solo lo que sí aparece y menciona explícitamente qué puntos no están documentados.\n"
         "\n"
         "4) ESTILO DE RESPUESTA:\n"
-        f"   — Responde en IDIOMA:{language}.\n"
+        f"   — Responde en IDIOMA:{_normalize_language_filter(language)}.\n"
         "   — Responde primero DE MANERA DIRECTA a la pregunta.\n"
         "   — No incluyas enlaces a menos que estén en INFORMACIÓN y empiecen por https, drive.google.com o docs.google.com.\n"
         "   — No repitas texto literal de los pasajes.\n"
@@ -1221,9 +1591,6 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         "--------------------------------------------------\n"
         "-PREGUNTA AGENTE:\n"
         f"{question}\n"
-        "-PREGUNTA REFRASEADA:\n"
-        f"{rephrased}\n"
-        "\n"
         "--------------------------------------------------\n"
         "5) FORMATO DE SALIDA: RESPUESTA (ESTRICTO):\n"
         "   <RESPUESTA>\n"
@@ -1241,19 +1608,53 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         "\n"
     )
     try:
-        full_answer, timed_out = _invoke_chat_with_timeout(
-            GPT_OSS_120_MODEL_ID,
-            answer_prompt,
-            max_tokens=ANSWER_MAX_TOKENS,
-            temperature=0.0
-        )
-        full_answer = (full_answer or "").strip()
-        full_answer = remove_reasoning_blocks(full_answer)
-        print("******************FULL ANSWER************************")
-        print(full_answer)
-        print("******************END FULL ANSWER************************")
+        MAX_RETRIES = 3
+
+        full_answer = None
+        timed_out = False
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                full_answer, timed_out = _invoke_chat_with_timeout(
+                    GPT_OSS_120_MODEL_ID,
+                    answer_prompt,
+                    max_tokens=ANSWER_MAX_TOKENS,
+                    temperature=0.0
+                )
+
+                full_answer = (full_answer or "").strip()
+
+                # Si el modelo falló (según tu contrato), reintentamos
+                if full_answer == "Intermitencia de Servicio":
+                    if attempt < MAX_RETRIES:
+                        continue
+                    # último intento y falló -> rompemos para caer al fallback
+                    break
+
+                # OK: limpiamos y salimos
+                # full_answer = remove_reasoning_blocks(full_answer)
+                full_answer, reasoning_blocks = split_reasoning_blocks(full_answer)
+                reasoning_text = "\n\n".join(reasoning_blocks)
+                print("Razonamiento: ",reasoning_text)
+                break
+
+            except Exception:
+                # Excepción inesperada: reintenta también (opcional)
+                if attempt < MAX_RETRIES:
+                    continue
+                full_answer = "Intermitencia de Servicio"
+                break
+
+        # Fallback final si quedó en error / None / vacío por cualquier motivo
+        if not full_answer or full_answer == "Intermitencia de Servicio":
+            full_answer = "Intermitencia de Servicio"
+
+        print("FULL ANSWER:",full_answer)
     except Exception:
-        full_answer = "(RESUMEN) No se pudo generar."
+        full_answer = "Intermitencia de Servicio"
+
+    print("len prompt qna:",len(answer_prompt))
+    print("prompt qna:",answer_prompt)
 
     mark(execution_times, 'generateAnswer_totalTime', t6)
     print(f"----------FIN - GENERAR RESPUESTA----------")
@@ -1409,6 +1810,11 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         if resumen is not None and resumen != "":
             resumen = format_resumen(resumen)
             resumen = convertir_links_html(resumen)
+            resumen = formatear_texto(resumen)
+            if _normalize_language_filter(language) == 'portugues':
+                resumen += '<br><br> <b>Fonte:</b> '+title_to_show
+            else:
+                resumen += '<br><br> <b>Fuente:</b> '+title_to_show
         else:
             resumen = "Intermitencia de Servicio"
         print("*****************RESUMEN*************************")
@@ -1435,6 +1841,8 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         question_item = {
             'id': str(uuid.uuid4()),
             'session_id': session_id or '',
+            'agent_name': name or 'No encontré Nombre',
+            'agent_email': email or 'No encontré Email',
             'question': question or '',
             'rephrased': rephrased or '',
             'category': category or 'Sin categoría',
@@ -1443,7 +1851,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
             'rag_files': rag_files or '',
             'date': now_santiago or '',
             'total_execution_time': str(total_time),
-            'fragments': [],
+            'fragments': articulo,
         }
         try:
             questions_table.put_item(Item=question_item)
@@ -1470,12 +1878,14 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         print("*************************************************************")
         t10 = tstart()
         print(f"----------INICIO - BUILD RESPONSE ----------")
-        error_msg = "Error"
+        error_msg = "No encontrado en Información"
         if not resumen.strip(): 
             resumen = error_msg
         if not raw_additional.strip() or raw_additional.strip() == '[]':
             raw_additional = error_msg
             raw_additional_cleaned = error_msg
+        if resumen == 'No encontrado en Información':
+            raw_additional_clean = 'No encontrado en Información'
 
         response_body = {
             "sessionAttributes": {
@@ -1484,8 +1894,8 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 "kbid": KB_ID,
                 "category": category or 'Sin categoría',
                 "raw_message": resumen.replace("\n", "<br>"),
-                "raw_additional": raw_additional or 'ERROR_GENERATION',
-                "raw_additional_clean": raw_additional_clean.replace("\n", "") or 'No encontrado en Información.',
+                "raw_additional": raw_additional or 'Intermitencia de Servicio',
+                "raw_additional_clean": raw_additional_clean.replace("\n", "") or 'Intermitencia de Servicio',
                 "fragments_used": articulo,
                 "session_id": session_id,
                 "rag_files": rag_files,
