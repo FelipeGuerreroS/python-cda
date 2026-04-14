@@ -151,7 +151,7 @@ def tstart() -> float:
     return perf_counter()
 
 def mark(execution_times: dict, key: str, t0: float) -> None:
-    execution_times[key] = round(perf_counter() - t0, 4)
+    execution_times[key] = round(perf_counter() - t0, 2)
 
 ## VARIABLES GLOBALES
 
@@ -893,8 +893,25 @@ def is_valid_text(raw_txt: str, min_chars: int = MIN_VALID_CHARS) -> bool:
     return len(txt) >= min_chars
 
 
+def _build_s3_candidates(uri: str, prefix: str = S3_PREFIX) -> list[str]:
+    normalized_input = normalize_s3_uri(uri)
+    if not normalized_input:
+        return []
+
+    normalized_prefix = normalize_s3_uri(prefix).rstrip("/")
+    short_candidate = normalized_input
+    if normalized_input.startswith(normalized_prefix):
+        short_candidate = normalized_input[len(normalized_prefix):].lstrip("/")
+
+    first_candidate = normalize_s3_uri(f"{normalized_prefix}/{short_candidate.lstrip('/')}")
+    candidates = [first_candidate]
+    if normalized_input != first_candidate:
+        candidates.append(normalized_input)
+    return candidates
+
+
 def fetch_with_fallback(uri: str, prefix: str = S3_PREFIX, min_chars: int = MIN_VALID_CHARS):
-    candidates = [prefix + uri, uri]
+    candidates = _build_s3_candidates(uri, prefix=prefix)
     errors = []
 
     for candidate in candidates:
@@ -1008,12 +1025,20 @@ def fetch_first_valid_text(uri: str, min_chars: int = MIN_VALID_CHARS):
     return None, None
 
 def remove_resumen_tag(text: str) -> str:
-    return re.sub(r'\[\s*/\s*RESUMEN\s*\]', '', text, flags=re.IGNORECASE)
+    return re.sub(
+        r'(\[\s*/?\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*\]|<\s*/?\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*>)',
+        '',
+        text,
+        flags=re.IGNORECASE
+    )
 
 def clean_newlines(text):
     if text:
         return text.replace("\\n", "\n").replace("\n\n", "\n\n").strip()
     return ""
+
+def clean_response_text(text: str) -> str:
+    return remove_according_phrases(clean_newlines(text))
 
 def format_to_html(raw_text: str) -> str:
     """
@@ -1243,7 +1268,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     print(f"PREGUNTA: ",question)
     session_id = (data or {}).get('session_id')
     print(f"ID DE INTERACCIÓN: ",session_id)
-    language = (data or {}).get('language')
+    language = (data or {}).get('language') or 'español'
     print(f"IDIOMA: ",language)
     name = (data or {}).get('name')
     print(f"NOMBRE AGENTE: ",name)
@@ -1301,82 +1326,51 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     t3 = tstart()
     print(f"----------INICIO - RETRIEVE DOCS----------")
     category = "Sin categoría"
-    question_chunks = []
     rephrased_chunks = []
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        question_retrieve = executor.submit(retrieve_kb, question, language)
-        rephrased_retrieve = executor.submit(retrieve_kb, rephrased, language)
-        try:
-            question_chunks = question_retrieve.result()
-            question_chunks = normalize_results(question_chunks, "original")
-            print(f"1)  CHUNK QUESTION")
-            print(f"{question_chunks}")
-            print("--------")
-            
-            rephrased_chunks = rephrased_retrieve.result()
-            rephrased_chunks = normalize_results(rephrased_chunks, "rephrased")
-            print(f"2) CHUNK REPHRASED")
-            print(f"{rephrased_chunks}")
-            print("--------")
-        except Exception:
-            question_chunks = []
-            rephrased_chunks = []
+    try:
+        rephrased_chunks = retrieve_kb(rephrased, language)
+        rephrased_chunks = normalize_results(rephrased_chunks, "rephrased")
+        print(f"CHUNK REPHRASED")
+        print(f"{rephrased_chunks}")
+        print("--------")
+    except Exception:
+        rephrased_chunks = []
 
     mark(execution_times, 'categorizationAndRag', t3)
     print(f"----------FIN - RETRIEVE DOCS----------")
     print("***********************************************************")
     t4 = tstart()
     print(f"----------INICIO - SELECCIÓN ARTICULO----------")
-    consensus_doc = same_top_doc(
-        question_chunks,
-        rephrased_chunks,
-        min_score=0.81,
-        debug=False
-    )
-    if consensus_doc:
-        selected_doc = consensus_doc
-        print("SELECCIÓN CONSENSUADA")
-    else:
-        merged_docs = merge_results(question_chunks, rephrased_chunks)
-        heuristic_doc = pick_by_heuristics(
-            merged_docs,
-            min_avg_score=0.79,
-            max_rank_allowed=2,
-            debug=False
+    merged_docs = merge_results([], rephrased_chunks)
+    candidate_docs = build_llm_candidates_payload(merged_docs, max_candidates=7)
+    docs_text = ""
+    print(candidate_docs)
+    for d in candidate_docs:
+        raw_doc = (d.get("doc") or {}).get("raw", {})
+        description = (raw_doc.get("metadata") or {}).get("context_short", "No hay 'context_short'")
+        topics = (raw_doc.get("metadata") or {}).get("context_bullets", "No hay 'context_bullets'")
+        topics_str = str(topics)
+        full_text = raw_doc.get("content", {}).get("text", "")
+        sample = (full_text[:9900] + "...") if len(full_text) > 9900 else full_text
+        not_covered = (raw_doc.get("metadata") or {}).get("not_covered", "No hay 'not_covered'")
+        intents = (raw_doc.get("metadata") or {}).get("intents", "No hay 'intents'")
+
+        docs_text += (
+            f"Documento {d['id']}:\n"
+            f"  -id: {d['id']}\n"
+            f"  -titulo: {d['title']}\n"
+            f"  -descripción: {description}\n"
+            f"  -sample:\n{sample}.\n\n"
+            f"  -topicos: {topics_str}\n"
+            f"  -topicos no cubiertos (excluyente): {not_covered}\n"
+            f"  -intents: {intents}\n"
         )
-        if heuristic_doc:
-            selected_doc = heuristic_doc
-            print("SELECCIÓN HEURISTICA")
-        else:
-            candidate_docs = build_llm_candidates_payload(merged_docs, max_candidates=7)
-            docs_text = ""
-            print(candidate_docs)
-            for d in candidate_docs:
 
-                raw_doc = (d.get("doc") or {}).get("raw", {})
-                md_doc = (raw_doc.get("doc") or {}).get("metadata", {})
-
-                description = (raw_doc.get("metadata") or {}).get("context_short", "No hay 'context_short'")
-                topics = (raw_doc.get("metadata") or {}).get("context_bullets", "No hay 'context_bullets'")
-                topics_str = str(topics)
-                full_text = raw_doc.get("content", {}).get("text", "")
-                sample = (full_text[:9900] + "...") if len(full_text) > 9900 else full_text
-                not_covered = (raw_doc.get("metadata") or {}).get("not_covered", "No hay 'not_covered'")
-                intents = (raw_doc.get("metadata") or {}).get("intents", "No hay 'intents'")
-
-                docs_text += (
-                    f"Documento {d['id']}:\n"
-                    f"  -id: {d['id']}\n"
-                    f"  -titulo: {d['title']}\n"
-                    f"  -descripción: {description}\n"
-                    f"  -sample:\n{sample}.\n\n"
-                    f"  -topicos: {topics_str}\n"
-                    f"  -topicos no cubiertos (excluyente): {not_covered}\n"
-                    f"  -intents: {intents}\n"
-                )
-
-            print("docs_txt_ia: ",docs_text)
-            prompt_chunks = (
+    print("docs_txt_ia: ",docs_text)
+    if not candidate_docs:
+        selected_doc = {"title": "Título no encontrado", "raw": {}}
+    else:
+        prompt_chunks = (
                 "Eres un sistema de selección de documentos (retrieval re-ranking).\n"
                 "Tu tarea es elegir EXACTAMENTE 1 documento candidato que mejor responda la pregunta del usuario.\n\n"
 
@@ -1429,17 +1423,17 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
 
                 "RESPUESTA (SOLO EL id DEL DOCUMENTO ELEGIDO):"
             )
-            chosen_id = _invoke_chat(SONNET_45_MODEL_ID, prompt_chunks, max_tokens=10, temperature=0.0).strip()
-            print("CHOSEN ID - IA: ", chosen_id)
-            
-            chosen_candidate = next((c for c in candidate_docs if c["id"] == chosen_id), None)
+        chosen_id = _invoke_chat(SONNET_45_MODEL_ID, prompt_chunks, max_tokens=10, temperature=0.0).strip()
+        print("CHOSEN ID - IA: ", chosen_id)
+        
+        chosen_candidate = next((c for c in candidate_docs if c["id"] == chosen_id), None)
 
-            if not chosen_candidate:
-                print("No se encontró candidato para ese id, fallback a primero")
-                chosen_candidate = candidate_docs[0]
-                
-            selected_doc = chosen_candidate["doc"]
-            print("SELECCIÓN IA")
+        if not chosen_candidate:
+            print("No se encontró candidato para ese id, fallback a primero")
+            chosen_candidate = candidate_docs[0]
+            
+        selected_doc = chosen_candidate["doc"]
+        print("SELECCIÓN IA")
 
     print("---------")
     print(f"ARTICULO A UTILIZAR:")
@@ -1484,21 +1478,26 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     }
     
     metadata_list = []
+    uri_to_content: Dict[str, str] = {}
 
     for uri in uris:
         try:
             raw_txt, used_uri = fetch_with_fallback(uri)
             txt = normalize_text(raw_txt)
+            full_uri = normalize_s3_uri(used_uri)
 
             metadata_list.append({
-                "uri": used_uri,
+                "uri": full_uri,
                 "content": txt
             })
+            uri_to_content[full_uri] = txt
 
         except Exception:
+            candidates = _build_s3_candidates(uri)
+            fallback_uri = normalize_s3_uri(candidates[-1] if candidates else uri)
             metadata_list.append({
-                "uri": uri,
-                "content": "No encontrado: " + uri
+                "uri": fallback_uri,
+                "content": "No encontrado: " + fallback_uri
             })
             continue
 
@@ -1518,33 +1517,37 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     
     print("Glosario",glosario_str)
 
-    # --- Construye un mapa uri -> contenido (URIs normalizadas) ---
-    uri_to_content = {
-        normalize_s3_uri(item.get("uri", "")): (item.get("content", "") or "")
-        for item in metadata_list
-    }
+    short_to_full = {}
+    normalized_prefix = normalize_s3_uri(S3_PREFIX).rstrip("/")
+    for full_uri in uri_to_content.keys():
+        if full_uri.startswith(normalized_prefix):
+            short_key = full_uri[len(normalized_prefix):].lstrip("/")
+            short_to_full[short_key] = full_uri
 
     # --- Reemplazo en sel_text ---
-    # Captura [TABLA] o [FLUJO] seguido de una URI s3. La URI termina en whitespace (espacio/salto de línea).
+    # Captura [TABLA] o [FLUJO] seguido de una URI/token hasta espacio o salto de línea.
     pattern = re.compile(
-        r'\[(TABLA|FLUJO)\]([\s\S]*?)(s3://.*?\.(?:csv|txt|json))',
+        r'\[(TABLA|FLUJO)\]\s*([^\s]+)',
         flags=re.IGNORECASE | re.UNICODE
     )
     print("Sel_text articulo:",sel_text)
 
     def replace_match(m: re.Match) -> str:
         kind = m.group(1).upper()
-        middle = m.group(2) or ""   # texto dinámico (incluye la flecha si viene)
-        uri_raw = m.group(3)
+        uri_raw = m.group(2)
 
         uri_norm = normalize_s3_uri(uri_raw)
-        content = uri_to_content.get(uri_norm, "")
+        full_uri = uri_norm
+        if not full_uri.startswith("s3://"):
+            full_uri = short_to_full.get(uri_norm) or normalize_s3_uri(f"{S3_PREFIX.rstrip('/')}/{uri_norm.lstrip('/')}")
+
+        content = uri_to_content.get(full_uri, "")
 
         if not content:
-            return f'[{kind}]{middle}{uri_raw} [NO ENCONTRADO EN METADATA]'
+            return f'[{kind}] {full_uri} [NO ENCONTRADO EN METADATA]'
 
-        fin_tag = end_tag_for_uri(uri_norm, kind)
-        return f'[{kind}]{middle}{{ {content} }} [{fin_tag}]'
+        fin_tag = end_tag_for_uri(full_uri, kind)
+        return f'[{kind}]{{ {content} }} [{fin_tag}]'
 
     context_text = pattern.sub(replace_match, sel_text)
 
@@ -1592,12 +1595,12 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         "-PREGUNTA AGENTE:\n"
         f"{question}\n"
         "--------------------------------------------------\n"
-        "5) FORMATO DE SALIDA: RESPUESTA (ESTRICTO):\n"
-        "   <RESPUESTA>\n"
+        "5) FORMATO DE SALIDA: RESUMEN (ESTRICTO):\n"
+        "   <RESUMEN>\n"
         "   — Un único párrafo directo y específico respondiendo SOLO la pregunta.\n"
         "   — Incluye números EXACTOS, condiciones EXACTAS y wording fiel del documento.\n"
-        "   — Se abre con '<RESPUESTA>' y se finaliza con '</RESPUESTA>'.\n"
-        "   </RESPUESTA>\n"
+        "   — Se abre con '<RESUMEN>' y se finaliza con '</RESUMEN>'.\n"
+        "   </RESUMEN>\n"
         "5.1) FORMATO DE SALIDA: ADICIONAL (ESTRICTO):\n"
         "   [ADICIONAL]\n"
         "   — Lista de 2 a 10 viñetas con detalles adicionales relevantes, sin inventar nada.\n"
@@ -1671,12 +1674,12 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         # ======== RESUMEN ========
         m = re.search(
             r'''
-            \[\s*(?:RESPUESTA|RESPUEDA|RESPUESE|RESPUEDE)\s*\]\s*      # etiquetas [RESPUESTA]/[RESPUEDA]/[RESPUESE]/[RESPUEDE]
+            \[\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*\]\s*
             (.*?)                                                     # contenido
             \s*
             (?=
                 \[
-                /\s*(?:RESPUESTA|RESPUEDA|RESPUESE|RESPUEDE)\s*        # cierres [/RESPUESTA]/.../
+                /\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*
                 \]
                 |
                 \[\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]
@@ -1691,11 +1694,11 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         else:
             m = re.search(
                 r'''
-                <\s*(?:RESPUESTA|RESPUEDA|RESPUESE|RESPUEDE)\s*>\s*     # <RESPUESTA/RESPUEDA/RESPUESE/RESPUEDE>
+                <\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*>\s*
                 (.*?)                                                 # contenido
                 \s*
                 (?=
-                    </\s*(?:RESPUESTA|RESPUEDA|RESPUESE|RESPUEDE)\s*>   # </RESPUESTA/RESPUEDA/RESPUESE/RESPUEDE>
+                    </\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*>
                     |
                     </\s*>
                     |
@@ -1712,8 +1715,8 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 m = re.search(r'<\s*([^<>]+?)\s*>', full_answer_norm, flags=re.DOTALL)
                 if m:
                     inner = m.group(1).strip()
-                    # No tomar etiquetas <RESPUESTA>, <RESPUEDA>, <RESPUESE> ni <RESPUEDE> como contenido
-                    if inner.upper() not in ("RESPUESTA", "RESPUEDA", "RESPUESE", "RESPUEDE"):
+                    # No tomar etiquetas <RESUMEN> (y variantes) como contenido
+                    if inner.upper() not in ("RESUMEN", "RESUMÉN", "RESUMN", "RESUME"):
                         resumen = inner
 
         # ======== INFO_ADICIONAL ========
@@ -1755,15 +1758,15 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                     ):
                         info_adicional = candidate
 
-        # ======== RECUPERACIÓN PARA CASO MALFORMADO: <RESPUESTA> ... [/ADICIONAL] ... ========
+        # ======== RECUPERACIÓN PARA CASO MALFORMADO: <RESUMEN> ... [/ADICIONAL] ... ========
         try:
             closing_add_re = r'\[/\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]'
-            opening_res_re = r'<\s*(?:RESPUESTA|RESPUEDA|RESPUESE|RESPUEDE)\s*>'
+            opening_res_re = r'<\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*>'
 
             if not info_adicional:
                 text = full_answer_norm or ""
 
-                # Caso A: el RESPUESTA/RESPUEDA/RESPUESE/RESPUEDE quedó con un [/ADICIONAL] o [/ADICIAL] dentro (contaminado)
+                # Caso A: el RESUMEN quedó con un [/ADICIONAL] o [/ADICIAL] dentro (contaminado)
                 if resumen and re.search(closing_add_re, resumen, flags=re.IGNORECASE):
                     parts = re.split(closing_add_re, resumen, maxsplit=1, flags=re.IGNORECASE)
                     resumen = (parts[0] or "").strip()
@@ -1775,7 +1778,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                     if tail:
                         info_adicional = tail
 
-                # Caso B: existe <RESPUESTA/RESPUEDA/RESPUESE/RESPUEDE> y uno o más cierres [/ADICIONAL] o [/ADICIAL] sin apertura
+                # Caso B: existe <RESUMEN> y uno o más cierres [/ADICIONAL] o [/ADICIAL] sin apertura
                 if not info_adicional and re.search(opening_res_re, text, flags=re.IGNORECASE) and re.search(closing_add_re, text, flags=re.IGNORECASE):
                     after_resumen = re.split(opening_res_re, text, maxsplit=1, flags=re.IGNORECASE)[1]
                     before_close, *rest = re.split(closing_add_re, after_resumen, maxsplit=1, flags=re.IGNORECASE)
@@ -1785,7 +1788,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                     # Limpiar un posible segundo cierre al final del tail
                     cand_tail = re.sub(closing_add_re + r'\s*$', "", cand_tail, flags=re.IGNORECASE).strip()
 
-                    if cand_resumen and (not resumen or resumen.upper() in ("RESPUESTA", "RESPUEDA", "RESPUESE", "RESPUEDE")):
+                    if cand_resumen and (not resumen or resumen.upper() in ("RESUMEN", "RESUMÉN", "RESUMN", "RESUME")):
                         resumen = cand_resumen
                     if cand_tail:
                         info_adicional = cand_tail
@@ -1805,7 +1808,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         # print(f"----------INICIO - PARSEAR RESUMEN Y INFO ADICIONAL----------")
 
         # Limpieza Resumen
-        resumen = remove_according_phrases(resumen)
+        resumen = clean_response_text(resumen)
         resumen = remove_resumen_tag(resumen)
         if resumen is not None and resumen != "":
             resumen = format_resumen(resumen)
@@ -1825,11 +1828,10 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         print(info_adicional)
         print("*****************FIN INFO ADICIONAL*************************")
         raw_additional = format_to_html(info_adicional)
-        raw_additional = remove_according_phrases(raw_additional)
+        raw_additional = clean_response_text(raw_additional)
 
         # Limpieza Info Adicional para DynamoDB
-        raw_additional_clean = clean_newlines(info_adicional)
-        raw_additional_clean = remove_according_phrases(raw_additional_clean)
+        raw_additional_clean = clean_response_text(info_adicional)
 
         mark(execution_times, 'parseAnswer', t7)
         print(f"----------FIN - PARSEAR RESUMEN Y INFO ADICIONAL----------")
@@ -1837,7 +1839,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         print("*************************************************************")
         print(f"----------INICIO - GUARDAR HISTORIAL----------")
         now_santiago = datetime.now(ZoneInfo("America/Santiago")).isoformat()
-        total_time = sum(execution_times.values())
+        total_time = round(sum(execution_times.values()), 2)
         question_item = {
             'id': str(uuid.uuid4()),
             'session_id': session_id or '',
@@ -1850,8 +1852,9 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
             'additional_information': raw_additional_clean or 'ERROR_GENERATION',
             'rag_files': rag_files or '',
             'date': now_santiago or '',
-            'total_execution_time': str(total_time),
+            'total_execution_time': f"{total_time:.2f}",
             'fragments': articulo,
+            'language': _normalize_language_filter(language),
         }
         try:
             questions_table.put_item(Item=question_item)
@@ -1900,9 +1903,11 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 "session_id": session_id,
                 "rag_files": rag_files,
                 "links": links,
-                "metadata": metadata_response
+                "metadata": metadata_response,
+                "language": _normalize_language_filter(language),
             },
-            "total_execution_time": total_time
+            "total_execution_time": total_time,
+            "language": _normalize_language_filter(language),
         }
         if INCLUDE_EXEC_TIMES:
             response_body["execution_times"] = execution_times
@@ -1916,7 +1921,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         category = category or 'Sin categoría'
 
         t10 = tstart()  # o time.time(), como estés midiendo
-        total_time = time.time() - t0
+        total_time = round(sum(execution_times.values()), 2)
         mark(execution_times, "buildResponse", t10)
 
         response_body = { 
@@ -1932,9 +1937,11 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 "session_id": session_id,
                 "rag_files": rag_files,
                 "links": links,
-                "metadata": metadata_list
+                "metadata": metadata_list,
+                "language": _normalize_language_filter(language),
             },
-            "total_execution_time": total_time
+            "total_execution_time": total_time,
+            "language": _normalize_language_filter(language),
         }
         if INCLUDE_EXEC_TIMES:
             response_body["execution_times"] = execution_times
