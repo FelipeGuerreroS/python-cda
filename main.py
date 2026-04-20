@@ -136,7 +136,7 @@ def load_config() -> Config:
         include_exec_times=_get_bool_env("INCLUDE_EXEC_TIMES", True),
         kb_max_results=_get_int_env("KB_MAX_RESULTS", 9),
         kb_search_type=os.environ.get("KB_SEARCH_TYPE", "HYBRID"),
-        s3_files_prefix=os.environ.get("S3_FILES_PREFIX", "s3://files-cda/"),
+        s3_files_prefix=os.environ.get("S3_FILES_PREFIX", "s3://files-cda/contenido_articulos/"),
         invoke_timeout_seconds=_get_float_env("INVOKE_TIMEOUT_SECONDS", 27.5),
         bedrock_runtime_fallback_region=os.environ.get(
             "BEDROCK_RUNTIME_FALLBACK_REGION",
@@ -1551,7 +1551,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
 
     context_text = pattern.sub(replace_match, sel_text)
 
-    context_text = "Glosario: "+glosario_str + "Articulo: "+context_text
+    context_text = "Glosario: "+glosario_str + "Artículo: "+context_text
 
     mark(execution_times, 'loadChunk', t5)
     print(f"----------FIN - INYECCIÓN DEPENDENCIAS----------")
@@ -1906,8 +1906,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 "metadata": metadata_response,
                 "language": _normalize_language_filter(language),
             },
-            "total_execution_time": total_time,
-            "language": _normalize_language_filter(language),
+            "total_execution_time": total_time
         }
         if INCLUDE_EXEC_TIMES:
             response_body["execution_times"] = execution_times
@@ -1940,8 +1939,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 "metadata": metadata_list,
                 "language": _normalize_language_filter(language),
             },
-            "total_execution_time": total_time,
-            "language": _normalize_language_filter(language),
+            "total_execution_time": total_time
         }
         if INCLUDE_EXEC_TIMES:
             response_body["execution_times"] = execution_times
