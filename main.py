@@ -1372,6 +1372,421 @@ def clean_newlines(text):
 def clean_response_text(text: str) -> str:
     return remove_according_phrases(clean_newlines(text))
 
+
+def localized_not_found_message(language: Optional[str]) -> str:
+    """Devuelve el mensaje final de no encontrado según el idioma normalizado del evento."""
+    normalized_language = _normalize_language_filter(language)
+    if normalized_language == "portugues":
+        return "Não encontrado em Informações"
+    return "No encontrado en Información"
+
+
+def get_doc_unique_id(doc: Optional[dict]) -> str:
+    if not doc:
+        return ""
+    raw = doc.get("raw", {}) or {}
+    return (
+        doc.get("doc_id")
+        or raw.get("location", {}).get("s3Location", {}).get("uri", "")
+        or doc.get("title", "")
+        or ""
+    )
+
+
+def build_docs_text_for_reranking(
+    candidate_docs: List[dict],
+    excluded_doc_id: Optional[str] = None,
+) -> Tuple[str, List[dict]]:
+    docs_text = ""
+    eligible_candidates = []
+
+    for d in candidate_docs:
+        candidate_doc = d.get("doc") or {}
+        if excluded_doc_id and get_doc_unique_id(candidate_doc) == excluded_doc_id:
+            continue
+
+        eligible_candidates.append(d)
+        raw_doc = candidate_doc.get("raw", {}) or {}
+        metadata = raw_doc.get("metadata") or {}
+
+        description = metadata.get("context_short", "No hay 'context_short'")
+        topics = metadata.get("context_bullets", "No hay 'context_bullets'")
+        topics_str = str(topics)
+        not_covered = metadata.get("not_covered", "No hay 'not_covered'")
+        intents = metadata.get("intents", "No hay 'intents'")
+
+        urls_originales = metadata.get("urls", [])
+        urls = [url for url in urls_originales if "lucid.app" in url]
+        print("urls: ", urls)
+        titulos_links = extraer_titulos_links(urls)
+
+        if titulos_links:
+            flujos_str = "\n".join(
+                f"    {i}) {titulo}"
+                for i, titulo in enumerate(titulos_links, start=1)
+            )
+        else:
+            flujos_str = "    No hay flujos"
+
+        docs_text += (
+            f"Documento {d['id']}:\n"
+            f"  -id: {d['id']}\n"
+            f"  -titulo: {d['title']}\n"
+            f"  -descripción: {description}\n"
+            f"  -Flujos:\n{flujos_str}\n"
+            f"  -topicos: {topics_str}\n"
+            f"  -topicos no cubiertos (excluyente): {not_covered}\n"
+            f"  -intents: {intents}\n"
+        )
+
+    return docs_text, eligible_candidates
+
+
+def build_prompt_chunks(question: str, docs_text: str, excluded_doc_id: Optional[str] = None) -> str:
+    exclusion_rule = ""
+    if excluded_doc_id:
+        exclusion_rule = (
+            "REINTENTO OBLIGATORIO:\n"
+            f"- El documento con identificador interno '{excluded_doc_id}' ya fue usado y respondió NOT FOUND.\n"
+            "- Ese documento está excluido de esta selección. No lo vuelvas a elegir.\n\n"
+        )
+
+    return (
+        "Eres un sistema de selección de documentos y flujos relacionados (retrieval re-ranking).\n"
+        "Tu tarea es elegir EXACTAMENTE 1 documento candidato que mejor responda la pregunta del usuario,\n"
+        "y además elegir el o los flujos de ese documento que apoyan directamente la respuesta.\n\n"
+        f"{exclusion_rule}"
+        "REGLAS DE SALIDA (OBLIGATORIAS):\n"
+        "1) Debes responder ÚNICAMENTE con este formato:\n"
+        "   (<id_documento>)[<numeros_de_flujo_seleccionado>]\n"
+        "2) El id del documento va entre paréntesis.\n"
+        "3) Los números de los flujos seleccionados van entre corchetes.\n"
+        "4) Si aplica un solo flujo, responde por ejemplo: (2)[1]\n"
+        "5) Si aplican varios flujos, responde por ejemplo: (2)[1,2]\n"
+        "6) No incluyas ningún texto adicional: sin explicación, sin comillas, sin markdown, sin prefijos, sin saltos extra.\n"
+        "7) Debes elegir EXACTAMENTE 1 documento.\n"
+        "8) Debes elegir solo flujos existentes dentro del documento seleccionado.\n"
+        "9) Si el documento elegido no tiene ningún flujo claramente aplicable, responde con lista vacía, por ejemplo: (2)[]\n\n"
+        "CÓMO DECIDIR EL DOCUMENTO:\n"
+        "- Prioriza el documento que cubra MÁS directamente la pregunta del usuario.\n"
+        "- Usa 'titulo', 'descripción', 'topicos' e 'intents' para entender el tema general y el objetivo del documento.\n"
+        "- Usa 'Flujos' para identificar acciones, procesos o diagramas específicos que apoyan la respuesta.\n"
+        "- Revisa 'topicos no cubiertos' para DESCARTAR documentos que explícitamente no traten partes clave de la pregunta.\n"
+        "- No inventes información: decide SOLO con lo que aparece en los candidatos.\n\n"
+        "CÓMO DECIDIR LOS FLUJOS:\n"
+        "- Selecciona únicamente los flujos que estén directamente relacionados con la pregunta del usuario.\n"
+        "- Si la pregunta pide una acción, proceso, procedimiento, paso a paso, flujo o cómo hacer algo, prioriza los flujos cuyo título coincida con esa intención.\n"
+        "- Si varios flujos del mismo documento apoyan la pregunta, incluye todos sus números en orden ascendente.\n"
+        "- Si un flujo es de un caso parecido pero no del caso preguntado, no lo selecciones.\n"
+        "- No selecciones flujos de documentos no elegidos.\n"
+        "- No selecciones un flujo solo porque existe; debe apoyar directamente la pregunta.\n\n"
+        "HARD CONSTRAINTS (OBLIGATORIAS / PENALIZACIÓN MUY FUERTE SI NO SE CUMPLEN):\n"
+        "0) Antes de aplicar coincidencias por escenario, identifica la INFORMACIÓN principal que el usuario está pidiendo, no solo el contexto mencionado. Expresiones como 'en caso de', 'derivado de', 'por', 'debido a' o 'cuando ocurre' suelen introducir contexto o causa. La intención principal de la pregunta pesa más que el contexto; por tanto, si el contexto coincide con un documento general pero la información pedida coincide con un documento más específico, elige el documento específico.\n"
+        "1) Si la pregunta contiene un código/SSR o acrónimo específico, por ejemplo 'MAAS', 'INCU', 'WCHR',\n"
+        "   SOLO son elegibles documentos donde ese código aparezca literalmente en titulo/descripción/topicos/flujos,\n"
+        "   o un sinónimo directo inequívoco, por ejemplo MAAS = 'máxima asistencia'.\n"
+        "2) Restricciones explícitas del enunciado: si la pregunta menciona canal, herramienta, sistema, país,\n"
+        "   producto, normativa, mercado, rol o sigla operativa, esa mención debe aparecer o estar claramente implicada.\n"
+        "   Para eventos amplios como atraso, cancelación, cambio involuntario o contingencia, trátalos como contexto,\n"
+        "   salvo que la pregunta pida explícitamente el procedimiento general de ese evento.\n"
+        "3) Si la pregunta exige un canal concreto, por ejemplo 'por email', penaliza fuerte documentos cuyo foco sea otro canal,\n"
+        "   por ejemplo WhatsApp, Chat o voz, y que NO mencionen el canal solicitado.\n"
+        "4) Si la pregunta incluye 2 o más condiciones, gana el documento que cumpla MÁS condiciones simultáneamente,\n"
+        "   aunque otro documento sea muy fuerte en solo una de ellas.\n"
+        "5) Si 'topicos no cubiertos' declara que NO cubre una restricción explícita, descártalo o penalízalo al máximo.\n"
+        "6) Si la pregunta menciona explícitamente una normativa/mercado/rol o sigla operativa, por ejemplo\n"
+        "   'Código de Consumo PE', 'PE/Perú', 'no show', 'LUA', 'HVC', SOLO son elegibles documentos que mencionen literalmente\n"
+        "   esa misma señal en titulo/descripción/topicos/flujos/intents, o una variante obvia, por ejemplo 'Perú' para 'PE'.\n"
+        "   Si ningún documento menciona esas señales, elige el más cercano por intención y con menor conflicto en 'topicos no cubiertos'.\n"
+        "7) Si la pregunta contiene 'Staff travel' o 'consola', solo son elegibles docs que mencionen 'Staff travel'\n"
+        "   o el sistema/consola correspondiente. Si ninguno lo menciona, recién ahí cae al más cercano.\n\n"
+        "HEURÍSTICA DE SELECCIÓN:\n"
+        "A) Primero elige el documento más alineado con la pregunta.\n"
+        "B) Luego, dentro de ese documento, elige los flujos que apoyen directamente la pregunta.\n"
+        "C) Si el título de un flujo coincide semánticamente con la pregunta, es fuerte candidato.\n"
+        "D) Si varios documentos parecen relevantes, elige el que tenga mejor combinación de descripción + topicos + intents + flujos.\n"
+        "E) Si ninguno responde perfectamente, elige el MÁS cercano con mejor cobertura parcial y menor conflicto.\n\n"
+        "IMPORTANTE:\n"
+        "- No inventes IDs.\n"
+        "- No inventes números de flujo.\n"
+        "- No expliques tu decisión.\n"
+        "- No devuelvas títulos de flujos, solo sus números.\n"
+        "- La númeración de flujos se reinicia (vuelve a 1) por cada documento\n"
+        "- Debes escoger un único documento incluso si la cobertura es parcial.\n\n"
+        f"PREGUNTA DEL USUARIO:\n{question}\n\n"
+        "DOCUMENTOS CANDIDATOS (formato fijo):\n"
+        "Cada candidato aparece como:\n"
+        "Documento X:\n"
+        "  -id: <id>\n"
+        "  -titulo: <titulo>\n"
+        "  -descripción: <descripción>\n"
+        "  -Flujos:\n"
+        "    1) <titulo_flujo_1>\n"
+        "    2) <titulo_flujo_2>\n"
+        "    3) <titulo_flujo_3>\n"
+        "  -topicos: <topicos>\n"
+        "  -topicos no cubiertos (excluyente): <not_covered>\n"
+        "  -intents: <intents>\n\n"
+        f"{docs_text}\n\n"
+        "RESPUESTA OBLIGATORIA, SOLO EN FORMATO (<id_documento>)[<numeros_de_flujo_seleccionado>]:"
+    )
+
+
+def rerank_candidate_document(
+    candidate_docs: List[dict],
+    question: str,
+    excluded_doc_id: Optional[str] = None,
+) -> Tuple[Optional[dict], List[int], str, str]:
+    docs_text, eligible_candidates = build_docs_text_for_reranking(candidate_docs, excluded_doc_id)
+    print(docs_text)
+
+    if not eligible_candidates:
+        return None, [], "", docs_text
+
+    prompt_chunks = build_prompt_chunks(question, docs_text, excluded_doc_id=excluded_doc_id)
+    respuesta_ia = _invoke_chat(SONNET_45_MODEL_ID, prompt_chunks, max_tokens=100, temperature=0.0).strip()
+    chosen_id, chosen_flujos = parsear_respuesta_ia(respuesta_ia)
+
+    print(prompt_chunks)
+    print("CHOSEN DOC ID - IA:", chosen_id)
+    print("CHOSEN FLUJOS - IA:", chosen_flujos)
+
+    chosen_candidate = next((c for c in eligible_candidates if c["id"] == chosen_id), None)
+
+    if not chosen_candidate:
+        print("No se encontró candidato para ese id, fallback a primero")
+        chosen_candidate = eligible_candidates[0]
+
+    return chosen_candidate, chosen_flujos, prompt_chunks, docs_text
+
+
+def prepare_selected_doc_payload(selected_doc: dict, chosen_flujos: List[int]) -> dict:
+    title_to_show = selected_doc.get("title", "Título no encontrado")
+    print("Title to show:", title_to_show)
+
+    raw = selected_doc.get("raw", {}) or {}
+
+    rag_files = (
+        raw.get('location', {})
+        .get('s3Location', {})
+        .get('uri', '')
+        .replace(CONFIG.s3_files_prefix, '')
+    )
+
+    sel_text = (
+        raw.get('content', {})
+        .get('text', '')
+    )
+
+    meta = raw.get('metadata', {})
+
+    print("Sel_text original:")
+    print(sel_text)
+
+    selected_flows = obtener_flujos_seleccionados(meta, chosen_flujos)
+
+    print("Flujos seleccionados metadata:")
+    print(selected_flows)
+
+    selected_flow_urls_norm = {
+        flujo["url_norm"]
+        for flujo in selected_flows
+        if flujo.get("url_norm")
+    }
+
+    selected_flow_titles_norm = {
+        flujo.get("titulo_norm") or normalizar_texto_para_match(flujo.get("titulo", ""))
+        for flujo in selected_flows
+        if flujo.get("titulo_norm") or flujo.get("titulo")
+    }
+
+    print("Selected flow URLs norm:")
+    print(selected_flow_urls_norm)
+
+    print("Selected flow titles norm:")
+    print(selected_flow_titles_norm)
+
+    links_seleccionados = [
+        f"{flujo['url']};{flujo['titulo']}"
+        for flujo in selected_flows
+    ]
+
+    print("Links seleccionados raw:")
+    print(links_seleccionados)
+
+    links = convertir_links_a_html(links_seleccionados)
+
+    print("Links seleccionados HTML:")
+    print(links)
+
+    metadata_response = {
+        "tablas": meta.get("tablas", []),
+        "flujos": meta.get("flujos", []),
+    }
+
+    glosario_uris = meta.get('glosario', []) or []
+    glosario_str = ""
+
+    for uri in glosario_uris:
+        try:
+            raw_txt, used_uri = fetch_with_fallback(uri)
+            txt = normalize_text(raw_txt)
+            glosario_str += txt + "\n"
+        except Exception:
+            glosario_str += f"No encontre contenido en glosario: {uri}\n"
+            continue
+
+    print("----------FASE 1 - INYECCIÓN TABLAS----------")
+    tablas_uris = meta.get('tablas', []) or []
+
+    print("TABLAS URIS desde metadata:")
+    print(tablas_uris)
+
+    metadata_tablas, uri_to_content_tablas = cargar_dependencias(tablas_uris)
+
+    print("Metadata tablas:")
+    print(metadata_tablas)
+
+    context_text = inyectar_dependencias_por_tipo(
+        texto=sel_text,
+        uri_to_content=uri_to_content_tablas,
+        tipo="TABLA"
+    )
+
+    print("Texto después de inyectar TABLAS:")
+    print(context_text)
+
+    print("----------FASE 2 - FILTRO FLUJOS SELECCIONADOS----------")
+    print("Texto ANTES de filtrar FLUJOS:")
+    print(context_text)
+
+    context_text = filtrar_flujos_no_seleccionados_en_texto(
+        sel_text=context_text,
+        selected_flow_urls_norm=selected_flow_urls_norm,
+        selected_flow_titles_norm=selected_flow_titles_norm
+    )
+
+    print("Texto DESPUÉS de filtrar FLUJOS no seleccionados:")
+    print(context_text)
+
+    print("----------FASE 3 - EXTRACCIÓN FLUJOS POST-TABLAS----------")
+    flujos_uris = extraer_uris_por_tipo(
+        texto=context_text,
+        tipo="FLUJO"
+    )
+
+    print("FLUJOS URIS encontrados después de inyectar tablas y filtrar:")
+    print(flujos_uris)
+
+    print("----------FASE 4 - INYECCIÓN FLUJOS----------")
+    metadata_flujos, uri_to_content_flujos = cargar_dependencias(flujos_uris)
+
+    print("Metadata flujos:")
+    print(metadata_flujos)
+
+    context_text = inyectar_dependencias_por_tipo(
+        texto=context_text,
+        uri_to_content=uri_to_content_flujos,
+        tipo="FLUJO"
+    )
+
+    print("Texto final después de inyectar FLUJOS:")
+    print(context_text)
+
+    metadata_list = metadata_tablas + metadata_flujos
+
+    uri_to_content: Dict[str, str] = {}
+
+    for item in metadata_list:
+        uri_norm = normalize_s3_uri(item.get("uri", ""))
+        content = item.get("content", "") or ""
+        uri_to_content[uri_norm] = content
+
+    print("Metadata List final:")
+    print(metadata_list)
+
+    context_text = "Glosario: " + glosario_str + "Artículo: " + context_text
+
+    print("Context text final:")
+    print(context_text)
+
+    return {
+        "title_to_show": title_to_show,
+        "raw": raw,
+        "rag_files": rag_files,
+        "sel_text": sel_text,
+        "meta": meta,
+        "links": links,
+        "metadata_response": metadata_response,
+        "metadata_list": metadata_list,
+        "context_text": context_text,
+        "articulo": context_text,
+    }
+
+
+def build_answer_prompt(question: str, language: Optional[str], articulo: str) -> str:
+    return (
+        "STRICT INSTRUCTIONS (FOLLOW EXACTLY):\n"
+        "\n"
+        "1) SINGLE SOURCE OF TRUTH:\n"
+        "   — You may only use the INFORMATION section.\n"
+        "   — Do not use external knowledge.\n"
+        "   — Do not make inferences beyond the text.\n"
+        "   — Do not invent steps, deadlines, policies, processes, or conditions that are not mentioned.\n"
+        "   — FORBIDDEN: Do not invent exceptions, do not assume markets, and do not name countries that are not explicitly written in the provided INFORMATION.\n"
+        "\n"
+        "2) COMPLETE COVERAGE:\n"
+        "   — If the INFORMATION shows different rules by country (Argentina, Chile, Colombia, Uruguay, etc.), "
+        "you must include ALL explicit rules for EACH mentioned country.\n"
+        "   — Do not assume the question refers only to Chile.\n"
+        "\n"
+        "3) WHEN INFORMATION IS MISSING:\n"
+        "   — If there is NOT enough evidence in INFORMATION to answer the question, respond with exactly this string and nothing else: NOT FOUND\n"
+        "   — Do not wrap NOT FOUND in <RESUMEN>, [ADICIONAL], quotes, bullets, explanations, or any other text.\n"
+        "   — Do not translate NOT FOUND, regardless of the selected response language.\n"
+        "   — If the information is PARTIAL, do NOT use NOT FOUND. Answer only what is explicitly shown and clearly mention which points are not documented.\n"
+        "\n"
+        "4) RESPONSE STYLE:\n"
+        f"   — Respond only in LANGUAGE: {_normalize_language_filter(language)}.\n"
+        "   — The language value will be either Spanish or Portuguese.\n"
+        "   — Do not mix languages, except for proper names, system names, labels, or terms that must remain unchanged.\n"
+        "   — Always keep these terms exactly as written, without translating them: Latam Wallet, RESUMEN, ADICIONAL, NOT FOUND.\n"
+        "   — First, answer the question DIRECTLY.\n"
+        "   — COMPLETE FLOW RULE: If the question or process involves a support flow or operational steps, you MUST detail the procedure from beginning to end, but only with steps explicitly documented in INFORMATION. Include final actions in the systems, settlement, and the final closure or notification to the customer only if those elements are documented. If part of the flow is missing, clearly state which part is not documented.\n"
+        "   — LOGICAL CONDITIONALS RULE: Pay strict attention to the conditions in the question (e.g., 'if it was completed successfully', 'if it failed', 'if the person is a minor'). You must search the INFORMATION for the process branch that corresponds EXACTLY to that state. Do not mix steps from a successful process with steps from a failed process or an exception process.\n"
+        "   — ANCHORING DISCARD RULE: Do not choose a section of the INFORMATION only because it shares identical words with the question (e.g., 'Latam Wallet'). If the question describes an issue with one tool, but the documented solution requires migrating to another one (e.g., moving from Wallet to Bank Transfer in TV Web), you must prioritize the procedure that solves the specific situation described, not the one that repeats the words from the question more often.\n"
+        "   — Only include links if they appear explicitly in INFORMATION, start with https://, and belong to an allowed domain such as drive.google.com or docs.google.com.\n"
+        "   — Use terminology faithful to the document, but paraphrase whenever possible. Do not copy full passages literally.\n"
+        "\n"
+        "IMPORTANT OUTPUT EXCEPTION:\n"
+        "   — The RESUMEN and ADICIONAL format applies only when there is enough information to answer at least partially.\n"
+        "   — If there is not enough evidence in INFORMATION, the entire response must be exactly: NOT FOUND\n"
+        "\n"
+        "--------------------------------------------------\n"
+        "-INFORMATION:\n"
+        f"{articulo}.\n"
+        "\n"
+        "--------------------------------------------------\n"
+        "-AGENT QUESTION:\n"
+        f"{question}\n"
+        "--------------------------------------------------\n"
+        "5) OUTPUT FORMAT: RESUMEN (STRICT):\n"
+        "   <RESUMEN>\n"
+        "   — A single direct and specific paragraph answering ONLY the question.\n"
+        "   — Include EXACT numbers, EXACT conditions, and wording faithful to the document.\n"
+        "   — It must open with '<RESUMEN>' and close with '</RESUMEN>'.\n"
+        "   </RESUMEN>\n"
+        "\n"
+        "5.1) OUTPUT FORMAT: ADICIONAL (STRICT):\n"
+        "   [ADICIONAL]\n"
+        "   — List 2 to 10 bullet points with relevant additional details, without inventing anything.\n"
+        "   — Include country-specific rules if they exist.\n"
+        "   — Do not add steps that are not mentioned in INFORMATION.\n"
+        "   — It must open with '[ADICIONAL]' and close with '[/ADICIONAL]'.\n"
+        "   [/ADICIONAL]\n"
+        "\n"
+    )
+
 def format_to_html(raw_text: str) -> str:
     """
     Limpia y convierte un texto crudo con numeración, guiones y **bold**
@@ -2122,6 +2537,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
 
         full_answer = None
         timed_out = False
+        not_found_rerank_attempted = False
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -2133,6 +2549,57 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 )
 
                 full_answer = (full_answer or "").strip()
+
+                if full_answer == "NOT FOUND" and not not_found_rerank_attempted:
+                    not_found_rerank_attempted = True
+                    initial_doc_id = get_doc_unique_id(selected_doc)
+                    print("NOT FOUND en primer documento. Reintentando re-ranking sin el documento inicial:", initial_doc_id)
+
+                    retry_candidate, retry_chosen_flujos, retry_prompt_chunks, retry_docs_text = rerank_candidate_document(
+                        candidate_docs,
+                        question,
+                        excluded_doc_id=initial_doc_id,
+                    )
+
+                    if not retry_candidate:
+                        full_answer = localized_not_found_message(language)
+                        break
+
+                    selected_doc = retry_candidate["doc"]
+                    chosen_flujos = retry_chosen_flujos
+
+                    print("---------")
+                    print("ARTICULO A UTILIZAR EN REINTENTO:")
+                    print(f"{selected_doc}")
+                    print("---------")
+
+                    retry_payload = prepare_selected_doc_payload(selected_doc, chosen_flujos)
+                    title_to_show = retry_payload["title_to_show"]
+                    raw = retry_payload["raw"]
+                    rag_files = retry_payload["rag_files"]
+                    sel_text = retry_payload["sel_text"]
+                    meta = retry_payload["meta"]
+                    links = retry_payload["links"]
+                    metadata_response = retry_payload["metadata_response"]
+                    metadata_list = retry_payload["metadata_list"]
+                    context_text = retry_payload["context_text"]
+                    articulo = retry_payload["articulo"]
+                    answer_prompt = build_answer_prompt(question, language, articulo)
+
+                    print("LEN ARTICULO REINTENTO: ", len(articulo))
+                    print(articulo)
+
+                    full_answer, timed_out = _invoke_chat_with_timeout(
+                        GPT_OSS_120_MODEL_ID,
+                        answer_prompt,
+                        max_tokens=ANSWER_MAX_TOKENS,
+                        temperature=0.0
+                    )
+                    full_answer = (full_answer or "").strip()
+
+                    if full_answer == "NOT FOUND":
+                        full_answer = localized_not_found_message(language)
+                        break
 
                 # Si el modelo falló (según tu contrato), reintentamos
                 if full_answer == "Intermitencia de Servicio":
@@ -2327,7 +2794,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
             else:
                 resumen += '<br><br> <b>Fuente:</b> '+title_to_show
         else:
-            resumen = "No encontrado en Información"
+            resumen = localized_not_found_message(language)
             
         print("*****************RESUMEN*************************")
         print(resumen)
@@ -2390,14 +2857,14 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         print("*************************************************************")
         t10 = tstart()
         print(f"----------INICIO - BUILD RESPONSE ----------")
-        error_msg = "No encontrado en Información"
+        error_msg = localized_not_found_message(language)
         if not resumen.strip(): 
             resumen = error_msg
         if not raw_additional.strip() or raw_additional.strip() == '[]':
             raw_additional = error_msg
             raw_additional_clean = error_msg
-        if resumen == 'No encontrado en Información':
-            raw_additional_clean = 'No encontrado en Información'
+        if resumen == error_msg:
+            raw_additional_clean = error_msg
 
         response_body = {
             "sessionAttributes": {
@@ -2438,9 +2905,9 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 "rephrased_message": rephrased,
                 "kbid": KB_ID,
                 "category": category,
-                "raw_message": resumen.replace("\n", "<br>") if resumen else 'No encontrado en Información.',
+                "raw_message": resumen.replace("\n", "<br>") if resumen else localized_not_found_message(language),
                 "raw_additional": raw_additional or 'ERROR_GENERATION',
-                "raw_additional_clean": raw_additional_clean.replace("\n", "") if raw_additional_clean else 'No encontrado en Información.',
+                "raw_additional_clean": raw_additional_clean.replace("\n", "") if raw_additional_clean else localized_not_found_message(language),
                 "fragments_used": context_text,
                 "session_id": session_id,
                 "rag_files": rag_files,
