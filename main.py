@@ -1270,19 +1270,6 @@ def end_tag_for_uri(uri: str, fallback_kind: str) -> str:
         return 'FIN FLUJO'
     return f'FIN {fallback_kind}'
 
-def remove_reasoning_blocks(text: str) -> str:
-    text = re.sub(
-        r'<\s*reasoning\b[^>]*>.*?</\s*reasoning\s*>',
-        '',
-        text,
-        flags=re.IGNORECASE | re.DOTALL
-    )
-    # 2) Por si llega suelto un tag de apertura/cierre sin pareja
-    text = re.sub(r'</?\s*reasoning\b[^>]*>', '', text, flags=re.IGNORECASE)
-
-    # 3) Limpieza de comillas envolventes accidentales y espacios
-    return text.strip().strip('"').strip("'").strip()
-
 def split_reasoning_blocks(text: str) -> Tuple[str, List[str]]:
     # 1) Extraer el contenido interno de todos los bloques <reasoning>...</reasoning>
     reasoning_blocks = [
@@ -2537,7 +2524,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
 
         full_answer = None
         timed_out = False
-        not_found_rerank_attempted = False
+        not_found_rerank_attempted = True
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -2548,9 +2535,14 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                     temperature=0.0
                 )
 
-                full_answer = (full_answer or "").strip()
+                full_answer = (full_answer or "")
+                full_answer, reasoning_blocks = split_reasoning_blocks(full_answer)
+                reasoning_text = "\n\n".join(reasoning_blocks)
+                print("Razonamiento: ",reasoning_text)
+                print("Answer: ",full_answer)
+                
 
-                if full_answer == "NOT FOUND" and not not_found_rerank_attempted:
+                if full_answer == "NOT FOUND":
                     not_found_rerank_attempted = True
                     initial_doc_id = get_doc_unique_id(selected_doc)
                     print("NOT FOUND en primer documento. Reintentando re-ranking sin el documento inicial:", initial_doc_id)
@@ -2595,7 +2587,11 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                         max_tokens=ANSWER_MAX_TOKENS,
                         temperature=0.0
                     )
-                    full_answer = (full_answer or "").strip()
+                    full_answer = (full_answer or "")
+                    full_answer, reasoning_blocks = split_reasoning_blocks(full_answer)
+                    reasoning_text = "\n\n".join(reasoning_blocks)
+                    print("Razonamiento: ",reasoning_text)
+                    print("Answer: ",full_answer)
 
                     if full_answer == "NOT FOUND":
                         full_answer = localized_not_found_message(language)
@@ -2607,12 +2603,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                         continue
                     # último intento y falló -> rompemos para caer al fallback
                     break
-
-                # OK: limpiamos y salimos
-                # full_answer = remove_reasoning_blocks(full_answer)
-                full_answer, reasoning_blocks = split_reasoning_blocks(full_answer)
-                reasoning_text = "\n\n".join(reasoning_blocks)
-                print("Razonamiento: ",reasoning_text)
+                    
                 break
 
             except Exception:
@@ -2626,11 +2617,11 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         if not full_answer or full_answer == "Intermitencia de Servicio":
             full_answer = "Intermitencia de Servicio"
 
-        print("FULL ANSWER:",full_answer)
     except Exception:
         full_answer = "Intermitencia de Servicio"
 
-    print("len prompt qna:",len(answer_prompt))
+    print("FULL ANSWER",full_answer)
+    print("--------------------")
     print("prompt qna:",answer_prompt)
 
     mark(execution_times, 'generateAnswer_totalTime', t6)
