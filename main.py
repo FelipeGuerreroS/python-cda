@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from collections import defaultdict
 from decimal import Decimal
 from time import perf_counter
-from typing import Any, Mapping, Dict, List, Tuple, Optional
+from typing import Any, Mapping, Dict, List, Set, Tuple, Optional
 from urllib.parse import urlparse, urlunparse
 from html import escape
 import boto3
@@ -134,9 +134,9 @@ def load_config() -> Config:
         anthropic_version=os.environ.get("ANTHROPIC_VERSION", "bedrock-2023-05-31"),
         categories=os.environ.get("CATEGORIES", "").split(","),
         include_exec_times=_get_bool_env("INCLUDE_EXEC_TIMES", True),
-        kb_max_results=_get_int_env("KB_MAX_RESULTS", 9),
+        kb_max_results=_get_int_env("KB_MAX_RESULTS", 17),
         kb_search_type=os.environ.get("KB_SEARCH_TYPE", "HYBRID"),
-        s3_files_prefix=os.environ.get("S3_FILES_PREFIX", "s3://files-cda/contenido_articulos/"),
+        s3_files_prefix=os.environ.get("S3_FILES_PREFIX", "s3://files-cda-int/contenido_articulos/"),
         invoke_timeout_seconds=_get_float_env("INVOKE_TIMEOUT_SECONDS", 27.5),
         bedrock_runtime_fallback_region=os.environ.get(
             "BEDROCK_RUNTIME_FALLBACK_REGION",
@@ -198,8 +198,8 @@ conversations_table = dynamo.Table(CONV_TABLE_NAME)
 questions_table     = dynamo.Table(QUESTIONS_TABLE_NAME)
 
 ## MENSAJES PROTOTIPOS
-MIN_VALID_CHARS = 50
-S3_PREFIX = "s3://files-cda/contenido_dependencias"
+MIN_VALID_CHARS = 1
+S3_PREFIX = "s3://files-cda-int/contenido_dependencias"
 error_msg = "Error"
 
 _S3_RE = re.compile(
@@ -526,6 +526,12 @@ def retrieve_kb(txt: str, language: Optional[str]) -> list[dict]:
     )
     return kb_resp.get("retrievalResults", [])
 
+def normalizar_texto_para_match(texto: str) -> str:
+    if not texto:
+        return ""
+
+    return re.sub(r"\s+", " ", texto.strip().lower())
+
 def normalize_results(results, source_label, max_description_len=15000):
     normalized = []
     for r in results:
@@ -664,6 +670,31 @@ def formatear_texto(texto: str) -> str:
 
     return texto
 
+def parsear_respuesta_ia(respuesta_ia: str):
+    """
+    Convierte una respuesta tipo '(2)[1,2]' en:
+    chosen_doc_id = '2'
+    chosen_flujos = [1, 2]
+    """
+    match = re.match(r'^\s*\(([^)]+)\)\s*\[([^\]]*)\]\s*$', respuesta_ia)
+
+    if not match:
+        raise ValueError(f"Formato inválido devuelto por IA: {respuesta_ia}")
+
+    chosen_doc_id = match.group(1).strip()
+    flujos_raw = match.group(2).strip()
+
+    if flujos_raw:
+        chosen_flujos = [
+            int(x.strip())
+            for x in flujos_raw.split(",")
+            if x.strip()
+        ]
+    else:
+        chosen_flujos = []
+
+    return chosen_doc_id, chosen_flujos
+
 def pick_by_heuristics(
     merged_docs,
     min_avg_score=0.75,
@@ -705,7 +736,7 @@ def pick_by_heuristics(
     # devolvemos el doc normalizado que tiene el "raw"
     return best_merged.get("doc") or best_merged
 
-def build_llm_candidates_payload(merged_docs, max_candidates=9):
+def build_llm_candidates_payload(merged_docs, max_candidates=15):
     # Ordenar por mejor score (tomando el mejor de original/rephrased)
     def best_score(d):
         scores = []
@@ -745,40 +776,220 @@ def find_doc_by_id(all_normalized_results, chosen_id):
             return item
     return None
 
-def normalizar_links(lista_links):
+def normalizar_url_para_match(url: str) -> str:
     """
-    Recibe una lista de URLs y devuelve una lista sin duplicados,
-    normalizando pequeñas variaciones (barra final, comillas, etc.)
+    Normaliza URLs para comparar:
+    - baja netloc a minúsculas
+    - elimina fragmentos tipo #
+    - elimina slash final
     """
-    urls_limpias = set()
+    if not url:
+        return ""
 
-    for link in lista_links:
-        if not isinstance(link, str):
+    url = url.strip().strip('"').strip("'").strip()
+
+    # Quitar caracteres típicos que pueden quedar pegados por regex
+    url = url.rstrip(").,;] ")
+
+    parsed = urlparse(url)
+
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path.rstrip("/") if parsed.path != "/" else parsed.path
+
+    return urlunparse((
+        scheme,
+        netloc,
+        path,
+        "",
+        parsed.query,
+        ""  # eliminamos fragment/hash
+    ))
+
+
+def extraer_flujos_desde_metadata(meta: dict) -> List[dict]:
+    """
+    Convierte metadata['urls'] en una lista de flujos numerados.
+
+    Ejemplo de entrada:
+    [
+        'https://...;Flujo Emisión Exceso de Equipaje',
+        'https://...;Flujo Emisión Oversize de Equipaje'
+    ]
+
+    Salida:
+    [
+        {'numero': 1, 'url': 'https://...', 'url_norm': 'https://...', 'titulo': '...'},
+        {'numero': 2, 'url': 'https://...', 'url_norm': 'https://...', 'titulo': '...'}
+    ]
+    """
+    urls = meta.get("urls", []) or []
+
+    flujos = []
+
+    for idx, item in enumerate(urls, start=1):
+        if not isinstance(item, str):
             continue
 
-        link = link.strip().strip('"').strip("'")
+        item = item.strip().strip('"').strip("'")
 
-        parsed = urlparse(link)
+        if ";" not in item:
+            continue
+
+        url, titulo = item.split(";", 1)
+
+        url = url.strip()
+        titulo = titulo.strip()
+
+        flujos.append({
+            "numero": idx,
+            "url": url,
+            "url_norm": normalizar_url_para_match(url),
+            "titulo": titulo
+        })
+
+    return flujos
+
+
+def obtener_flujos_seleccionados(meta: dict, chosen_flujos: List[int]) -> List[dict]:
+    """
+    Devuelve solo los flujos elegidos por la IA.
+    """
+    flujos = extraer_flujos_desde_metadata(meta)
+    chosen_set = set(chosen_flujos)
+
+    return [
+        flujo for flujo in flujos
+        if flujo["numero"] in chosen_set
+    ]
+
+def filtrar_flujos_no_seleccionados_en_texto(
+    sel_text: str,
+    selected_flow_urls_norm: Set[str],
+    selected_flow_titles_norm: Set[str] = None,
+    window_before: int = 1200,
+    window_after: int = 300
+) -> str:
+    """
+    Elimina los marcadores [FLUJO] s3://... que NO correspondan
+    a los flujos seleccionados por la IA.
+
+    Hace match por:
+    1) URL cercana al marcador [FLUJO]
+    2) Título cercano al marcador [FLUJO]
+    """
+
+    if selected_flow_titles_norm is None:
+        selected_flow_titles_norm = set()
+
+    flujo_pattern = re.compile(
+        r'\(?\s*\[FLUJO\]\s*(?P<uri>s3://.*?\.(?:csv|txt|json))\s*\)?',
+        flags=re.IGNORECASE | re.UNICODE
+    )
+
+    url_pattern = re.compile(
+        r'https?://[^\s\)\]\}]+',
+        flags=re.IGNORECASE | re.UNICODE
+    )
+
+    partes = []
+    last_pos = 0
+
+    for match in flujo_pattern.finditer(sel_text):
+        start, end = match.span()
+
+        texto_antes = sel_text[max(0, start - window_before):start]
+        texto_despues = sel_text[end:min(len(sel_text), end + window_after)]
+        texto_cercano = texto_antes + " " + texto_despues
+        texto_cercano_norm = normalizar_texto_para_match(texto_cercano)
+
+        flujo_es_seleccionado = False
+
+        # 1) Match por URL cercana
+        urls_cercanas = url_pattern.findall(texto_cercano)
+
+        for url_cercana in urls_cercanas:
+            url_cercana_norm = normalizar_url_para_match(url_cercana)
+
+            if url_cercana_norm in selected_flow_urls_norm:
+                flujo_es_seleccionado = True
+                break
+
+        # 2) Match por título cercano
+        if not flujo_es_seleccionado:
+            for titulo_norm in selected_flow_titles_norm:
+                if titulo_norm and titulo_norm in texto_cercano_norm:
+                    flujo_es_seleccionado = True
+                    break
+
+        partes.append(sel_text[last_pos:start])
+
+        if flujo_es_seleccionado:
+            partes.append(sel_text[start:end])
+        else:
+            partes.append("")
+
+        last_pos = end
+
+    partes.append(sel_text[last_pos:])
+
+    return "".join(partes)
+
+def extraer_uris_flujo_presentes(sel_text: str) -> List[str]:
+    """
+    Extrae las URIs s3 de flujos que siguen presentes en el texto.
+    """
+    pattern = re.compile(
+        r'\[FLUJO\]\s*(s3://.*?\.(?:csv|txt|json))',
+        flags=re.IGNORECASE | re.UNICODE
+    )
+
+    return pattern.findall(sel_text)
+
+def normalizar_links(lista_links):
+    """
+    Recibe una lista con formato 'url;titulo' y devuelve una lista sin duplicados,
+    normalizando solo la URL y preservando el título.
+    """
+    links_limpios = {}
+
+    for item in lista_links:
+        if not isinstance(item, str):
+            continue
+
+        item = item.strip().strip('"').strip("'")
+
+        if ';' not in item:
+            continue
+
+        url, titulo = item.split(';', 1)
+        url = url.strip()
+        titulo = titulo.strip()
+
+        parsed = urlparse(url)
 
         netloc = parsed.netloc.lower()
-
         path = parsed.path.rstrip('/') if parsed.path != '/' else parsed.path
 
-        normalized = urlunparse((parsed.scheme, netloc, path, '', parsed.query, parsed.fragment))
+        normalized_url = urlunparse((
+            parsed.scheme,
+            netloc,
+            path,
+            '',
+            parsed.query,
+            parsed.fragment
+        ))
 
-        urls_limpias.add(normalized)
+        # Deduplicar por URL normalizada, preservando el primer título encontrado
+        if normalized_url not in links_limpios:
+            links_limpios[normalized_url] = titulo
 
-    # Convertir de nuevo a lista ordenada
-    return sorted(urls_limpias)
+    return [
+        f"{url};{titulo}"
+        for url, titulo in links_limpios.items()
+    ]
 
 def parsear_link_y_titulo(valor: Any) -> Dict[str, str]:
-    """
-    Acepta:
-      - 'https://...;Flujo XYZ'
-      - 'https://...'
-    y devuelve:
-      {'url': 'https://...', 'title': 'Flujo XYZ'}
-    """
     if not isinstance(valor, str):
         return {"url": "", "title": ""}
 
@@ -800,14 +1011,6 @@ def parsear_link_y_titulo(valor: Any) -> Dict[str, str]:
 
 
 def normalizar_url(url: str) -> str:
-    """
-    Normaliza pequeñas variaciones de una URL:
-    - trim
-    - minúsculas en scheme y netloc
-    - quita slash final del path
-    - conserva query string
-    - elimina fragment
-    """
     if not isinstance(url, str):
         return ""
 
@@ -823,9 +1026,31 @@ def normalizar_url(url: str) -> str:
 
     return urlunparse((scheme, netloc, path, "", parsed.query, ""))
 
+def extraer_titulos_links(lista_links):
+    """
+    Recibe una lista de links con formato 'url;titulo'
+    y devuelve solo los títulos.
+    """
+    titulos = []
+
+    for item in lista_links:
+        if not isinstance(item, str):
+            continue
+
+        item = item.strip().strip('"').strip("'")
+
+        if ';' not in item:
+            continue
+
+        _, titulo = item.split(';', 1)
+        titulo = titulo.strip()
+
+        if titulo:
+            titulos.append(titulo)
+
+    return titulos
 
 def convertir_links_a_html(links):
-    # Si viene como string con formato de lista, lo convertimos a lista real
     if isinstance(links, str):
         links = ast.literal_eval(links)
 
@@ -833,9 +1058,9 @@ def convertir_links_a_html(links):
 
     for item in links:
         if ';' not in item:
-            continue  # omite elementos mal formateados
+            continue
 
-        url, titulo = item.split(';', 1)  # separa solo en el primer ;
+        url, titulo = item.split(';', 1)
         url = url.strip()
         titulo = titulo.strip()
 
@@ -850,15 +1075,26 @@ def convertir_links_a_html(links):
 
     return resultado
 
-def normalize_s3_uri(u: str) -> str:
-    if not isinstance(u, str):
+def strip_s3_scheme(value: str) -> str:
+    if not value:
         return ""
-    u = u.strip()
-    u = re.sub(r'^s3(?:::|//)', 's3://', u)
-    u = re.sub(r'^s3:/', 's3://', u)
-    # limpia cierres/puntuación comunes
-    u = u.rstrip('),.;:]}"\'')
-    return u
+    value = str(value).strip()
+    value = re.sub(r"^s3:/+", "", value)
+    return value.lstrip("/")
+
+def normalize_s3_uri(uri: str) -> str:
+    if not uri:
+        return ""
+
+    uri = str(uri).strip()
+
+    # elimina prefijo s3:/, s3://, s3:////, etc. solo al inicio
+    uri = re.sub(r"^s3:/+", "", uri)
+
+    # elimina slashes repetidos en la parte restante
+    uri = re.sub(r"/{2,}", "/", uri.lstrip("/"))
+
+    return f"s3://{uri}"
 
 def fetch_s3_text(uri: str) -> str:
     parsed = urlparse(uri)
@@ -885,6 +1121,97 @@ def fetch_s3_text(uri: str) -> str:
 def normalize_text(raw_txt: str) -> str:
     return re.sub(r"\s+", " ", raw_txt.replace("\n", " ")).strip()
 
+def extraer_uris_por_tipo(texto: str, tipo: str) -> List[str]:
+    """
+    Extrae URIs s3 asociadas a un tipo específico: TABLA o FLUJO.
+    Busca patrones como:
+    [TABLA] s3://...
+    [FLUJO] s3://...
+    """
+    pattern = re.compile(
+        rf'\[{re.escape(tipo)}\]([\s\S]*?)(s3://.*?\.(?:csv|txt|json))',
+        flags=re.IGNORECASE | re.UNICODE
+    )
+
+    uris = []
+
+    for match in pattern.finditer(texto):
+        uri = match.group(2).strip()
+        uris.append(uri)
+
+    # deduplicar preservando orden
+    return list(dict.fromkeys(uris))
+
+
+def cargar_dependencias(uris: List[str]):
+    """
+    Descarga el contenido de las dependencias s3.
+    Retorna metadata_list y uri_to_content.
+    """
+    metadata_list = []
+    uri_to_content: Dict[str, str] = {}
+
+    for uri in uris:
+        try:
+            raw_txt, used_uri = fetch_with_fallback(uri)
+            txt = normalize_text(raw_txt)
+            full_uri = normalize_s3_uri(used_uri)
+
+            metadata_list.append({
+                "uri": full_uri,
+                "content": txt
+            })
+
+            uri_to_content[full_uri] = txt
+
+        except Exception:
+            candidates = _build_s3_candidates(uri)
+            fallback_uri = normalize_s3_uri(candidates[-1] if candidates else uri)
+
+            metadata_list.append({
+                "uri": fallback_uri,
+                "content": "No encontrado: " + fallback_uri
+            })
+
+            uri_to_content[fallback_uri] = "No encontrado: " + fallback_uri
+
+            continue
+
+    return metadata_list, uri_to_content
+
+
+def inyectar_dependencias_por_tipo(
+    texto: str,
+    uri_to_content: Dict[str, str],
+    tipo: str
+) -> str:
+    """
+    Inyecta dependencias de un solo tipo: TABLA o FLUJO.
+    No toca otros tipos.
+    """
+
+    pattern = re.compile(
+        rf'\[({re.escape(tipo)})\]([\s\S]*?)(s3://.*?\.(?:csv|txt|json))',
+        flags=re.IGNORECASE | re.UNICODE
+    )
+
+    def replace_match(m: re.Match) -> str:
+        kind = m.group(1).upper()
+        middle = m.group(2) or ""
+        uri_raw = m.group(3).strip()
+
+        uri_norm = normalize_s3_uri(uri_raw)
+        content = uri_to_content.get(uri_norm, "")
+
+        if not content:
+            return f'[{kind}]{middle}{uri_raw} [NO ENCONTRADO EN METADATA]'
+
+        fin_tag = end_tag_for_uri(uri_norm, kind)
+
+        return f'[{kind}]{middle}{{ {content} }} [{fin_tag}]'
+
+    return pattern.sub(replace_match, texto)
+
 
 def is_valid_text(raw_txt: str, min_chars: int = MIN_VALID_CHARS) -> bool:
     if not raw_txt:
@@ -899,14 +1226,21 @@ def _build_s3_candidates(uri: str, prefix: str = S3_PREFIX) -> list[str]:
         return []
 
     normalized_prefix = normalize_s3_uri(prefix).rstrip("/")
-    short_candidate = normalized_input
-    if normalized_input.startswith(normalized_prefix):
-        short_candidate = normalized_input[len(normalized_prefix):].lstrip("/")
 
-    first_candidate = normalize_s3_uri(f"{normalized_prefix}/{short_candidate.lstrip('/')}")
+    input_no_scheme = strip_s3_scheme(normalized_input)
+    prefix_no_scheme = strip_s3_scheme(normalized_prefix)
+
+    if input_no_scheme.startswith(prefix_no_scheme + "/"):
+        short_candidate = input_no_scheme[len(prefix_no_scheme):].lstrip("/")
+    else:
+        short_candidate = input_no_scheme
+
+    first_candidate = normalize_s3_uri(f"{normalized_prefix}/{short_candidate}")
     candidates = [first_candidate]
+
     if normalized_input != first_candidate:
         candidates.append(normalized_input)
+
     return candidates
 
 
@@ -917,9 +1251,7 @@ def fetch_with_fallback(uri: str, prefix: str = S3_PREFIX, min_chars: int = MIN_
     for candidate in candidates:
         try:
             raw_txt = fetch_s3_text(candidate)
-            print("len dependencia: ",len(raw_txt))
             if is_valid_text(raw_txt, min_chars=min_chars):
-                print("candidato valido: ",candidate)
                 return raw_txt, candidate
 
             errors.append(f"Contenido inválido o demasiado corto en: {candidate}")
@@ -1309,7 +1641,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         "- Conserva EXACTAMENTE el mismo vocabulario y términos de la consulta original.\n"
         "- NO uses sinónimos ni reemplaces palabras.\n"
         "- NO agregues información adicional ni contexto extra.\n"
-        f"- En IDIOMA: {language}.\n"
+        f"- En IDIOMA: {_normalize_language_filter(language)}.\n"
         "- Devuelve SOLO la pregunta corregida, sin comillas ni texto introductorio.\n\n"
         "Pregunta corregida:"
     )
@@ -1331,8 +1663,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         rephrased_chunks = retrieve_kb(rephrased, language)
         rephrased_chunks = normalize_results(rephrased_chunks, "rephrased")
         print(f"CHUNK REPHRASED")
-        print(f"{rephrased_chunks}")
-        print("--------")
+        print("---------------")
     except Exception:
         rephrased_chunks = []
 
@@ -1342,90 +1673,153 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     t4 = tstart()
     print(f"----------INICIO - SELECCIÓN ARTICULO----------")
     merged_docs = merge_results([], rephrased_chunks)
-    candidate_docs = build_llm_candidates_payload(merged_docs, max_candidates=7)
+    candidate_docs = build_llm_candidates_payload(merged_docs, max_candidates=15)
     docs_text = ""
-    print(candidate_docs)
     for d in candidate_docs:
         raw_doc = (d.get("doc") or {}).get("raw", {})
-        description = (raw_doc.get("metadata") or {}).get("context_short", "No hay 'context_short'")
-        topics = (raw_doc.get("metadata") or {}).get("context_bullets", "No hay 'context_bullets'")
+        metadata = raw_doc.get("metadata") or {}
+
+        description = metadata.get("context_short", "No hay 'context_short'")
+        topics = metadata.get("context_bullets", "No hay 'context_bullets'")
         topics_str = str(topics)
         full_text = raw_doc.get("content", {}).get("text", "")
-        sample = (full_text[:9900] + "...") if len(full_text) > 9900 else full_text
-        not_covered = (raw_doc.get("metadata") or {}).get("not_covered", "No hay 'not_covered'")
-        intents = (raw_doc.get("metadata") or {}).get("intents", "No hay 'intents'")
+        not_covered = metadata.get("not_covered", "No hay 'not_covered'")
+        intents = metadata.get("intents", "No hay 'intents'")
+
+        urls_originales = metadata.get("urls", [])
+        urls = [url for url in urls_originales if "lucid.app" in url]
+        print("urls: ",urls)
+        titulos_links = extraer_titulos_links(urls)
+
+        if titulos_links:
+            flujos_str = "\n".join(
+                f"    {i}) {titulo}"
+                for i, titulo in enumerate(titulos_links, start=1)
+            )
+        else:
+            flujos_str = "    No hay flujos"
 
         docs_text += (
             f"Documento {d['id']}:\n"
             f"  -id: {d['id']}\n"
             f"  -titulo: {d['title']}\n"
             f"  -descripción: {description}\n"
-            f"  -sample:\n{sample}.\n\n"
+            f"  -Flujos:\n{flujos_str}\n"
             f"  -topicos: {topics_str}\n"
             f"  -topicos no cubiertos (excluyente): {not_covered}\n"
             f"  -intents: {intents}\n"
         )
 
-    print("docs_txt_ia: ",docs_text)
+    print(docs_text)
     if not candidate_docs:
         selected_doc = {"title": "Título no encontrado", "raw": {}}
     else:
         prompt_chunks = (
-                "Eres un sistema de selección de documentos (retrieval re-ranking).\n"
-                "Tu tarea es elegir EXACTAMENTE 1 documento candidato que mejor responda la pregunta del usuario.\n\n"
+            "Eres un sistema de selección de documentos y flujos relacionados (retrieval re-ranking).\n"
+            "Tu tarea es elegir EXACTAMENTE 1 documento candidato que mejor responda la pregunta del usuario,\n"
+            "y además elegir el o los flujos de ese documento que apoyan directamente la respuesta.\n\n"
 
-                "REGLAS DE SALIDA (OBLIGATORIAS):\n"
-                "1) Debes responder ÚNICAMENTE con el valor del campo 'id' del documento elegido.\n"
-                "2) No incluyas ningún texto adicional: sin explicación, sin comillas, sin markdown, sin prefijos ('id:'), sin saltos extra.\n"
+            "REGLAS DE SALIDA (OBLIGATORIAS):\n"
+            "1) Debes responder ÚNICAMENTE con este formato:\n"
+            "   (<id_documento>)[<numeros_de_flujo_seleccionado>]\n"
+            "2) El id del documento va entre paréntesis.\n"
+            "3) Los números de los flujos seleccionados van entre corchetes.\n"
+            "4) Si aplica un solo flujo, responde por ejemplo: (2)[1]\n"
+            "5) Si aplican varios flujos, responde por ejemplo: (2)[1,2]\n"
+            "6) No incluyas ningún texto adicional: sin explicación, sin comillas, sin markdown, sin prefijos, sin saltos extra.\n"
+            "7) Debes elegir EXACTAMENTE 1 documento.\n"
+            "8) Debes elegir solo flujos existentes dentro del documento seleccionado.\n"
+            "9) Si el documento elegido no tiene ningún flujo claramente aplicable, responde con lista vacía, por ejemplo: (2)[]\n\n"
 
-                "CÓMO DECIDIR (CRITERIOS):\n"
-                "- Prioriza el documento que cubra MÁS directamente la pregunta.\n"
-                "- Usa 'title' y 'description' y 'topics' para entender el tema general y el objetivo del documento.\n"
-                "- Usa'sample' solo como ejemplo: es el primer fragmento del documento, no es el documento entero.\n"
-                "- Revisa 'not covered' para DESCARTAR documentos que explícitamente no traten partes clave de la pregunta.\n\n"
+            "CÓMO DECIDIR EL DOCUMENTO:\n"
+            "- Prioriza el documento que cubra MÁS directamente la pregunta del usuario.\n"
+            "- Usa 'titulo', 'descripción', 'topicos' e 'intents' para entender el tema general y el objetivo del documento.\n"
+            "- Usa 'Flujos' para identificar acciones, procesos o diagramas específicos que apoyan la respuesta.\n"
+            "- Revisa 'topicos no cubiertos' para DESCARTAR documentos que explícitamente no traten partes clave de la pregunta.\n"
+            "- No inventes información: decide SOLO con lo que aparece en los candidatos.\n\n"
 
-                "HARD CONSTRAINTS (OBLIGATORIAS / PENALIZACIÓN MUY FUERTE SI NO SE CUMPLEN):\n"
-                "0) Si la pregunta contiene un código/SSR o acrónimo específico (ej: 'MAAS', 'INCU', 'WCHR'), SOLO son elegibles documentos donde ese código aparezca literalmente en title/description/topics/sample, o un sinónimo directo inequívoco (ej: MAAS = 'máxima asistencia').\n"
-                "1) Restricciones explícitas del enunciado: si la pregunta menciona un canal, herramienta, sistema, país, producto, o tipo de caso específico, esa mención debe aparecer (o estar claramente implicada) en 'title'/'description'/'topics'/'sample'.\n"
-                "   - Ejemplos de canal: 'email/correo', 'WhatsApp', 'Chat', 'teléfono/voz'.\n"
-                "   - Ejemplos de herramienta/sistema: 'backup tools', 'Sabre', 'Allegro', 'Agente 360', etc.\n"
-                "2) Si la pregunta exige un canal concreto (p.ej., 'por email'), penaliza fuerte documentos cuyo foco sea otro canal (p.ej., WhatsApp/Chat/voz) y NO mencionen el canal solicitado.\n"
-                "3) Si la pregunta incluye 2 o más condiciones (p.ej., 'excepción grave' + 'herramientas backup' + 'email' + 'tipificación'), gana el documento que cumpla MÁS condiciones simultáneamente, aunque otro documento sea muy fuerte en solo una de ellas.\n"
-                "4) Si 'not covered' declara que NO cubre una restricción explícita (p.ej., 'no email' o 'no backup tools' o 'no tipificación'), descártalo o penalízalo al máximo.\n\n"
-                "5) Si la pregunta menciona explícitamente una normativa/mercado/rol o sigla operativa (ej: 'Código de Consumo PE', 'PE/Perú', 'no show', 'LUA', 'HVC'), SOLO son elegibles documentos que mencionen literalmente esa misma normativa/mercado/rol/sigla en 'title'/'description'/'topics'/'sample' (o una variante obvia: 'Perú' para 'PE').\n"
-                "   - Si un documento NO menciona esas señales, aplícale penalización máxima (casi descarte), aunque sea relevante de forma general.\n"
-                "   - EXCEPCIÓN: si NINGÚN documento menciona esas señales, entonces elige el más cercano por intención (p.ej. 'no show' -> cambios post-salida; 'Código de Consumo' -> políticas/excepciones de mercado) y con menor conflicto en 'not covered'.\n\n"
-                "6) Si la pregunta contiene “Staff travel” o “consola”, sólo son elegibles docs que mencionen “Staff travel” o el sistema/consola correspondiente, si no menciona: recién ahí caer al más cercano.\n\n"
+            "CÓMO DECIDIR LOS FLUJOS:\n"
+            "- Selecciona únicamente los flujos que estén directamente relacionados con la pregunta del usuario.\n"
+            "- Si la pregunta pide una acción, proceso, procedimiento, paso a paso, flujo o cómo hacer algo, prioriza los flujos cuyo título coincida con esa intención.\n"
+            "- Si varios flujos del mismo documento apoyan la pregunta, incluye todos sus números en orden ascendente.\n"
+            "- Si un flujo es de un caso parecido pero no del caso preguntado, no lo selecciones.\n"
+            "- No selecciones flujos de documentos no elegidos.\n"
+            "- No selecciones un flujo solo porque existe; debe apoyar directamente la pregunta.\n\n"
 
-                "HEURÍSTICA DE SELECCIÓN (rápida pero estricta):\n"
-                "A) Si un documento parece responder la pregunta y además su 'not covered' NO contradice esa necesidad, es fuerte candidato.\n"
-                "B) Si 'not covered' menciona explícitamente el tema preguntado (o una parte esencial), penalízalo fuerte.\n"
-                "C) Si varios parecen relevantes, elige el que tenga señales más claras en 'description' + 'topics'.\n"
-                "D) Si ninguno responde perfectamente, elige el MÁS cercano (mejor cobertura parcial) y con menor conflicto en 'not covered'.\n\n"
+            "HARD CONSTRAINTS (OBLIGATORIAS / PENALIZACIÓN MUY FUERTE SI NO SE CUMPLEN):\n"
+            "0) Antes de aplicar coincidencias por escenario, identifica la INFORMACIÓN principal que el usuario está pidiendo, no solo el contexto mencionado. Expresiones como 'en caso de', 'derivado de', 'por', 'debido a' o 'cuando ocurre' suelen introducir contexto o causa. La intención principal de la pregunta pesa más que el contexto; por tanto, si el contexto coincide con un documento general pero la información pedida coincide con un documento más específico, elige el documento específico.\n"
+            "1) Si la pregunta contiene un código/SSR o acrónimo específico, por ejemplo 'MAAS', 'INCU', 'WCHR',\n"
+            "   SOLO son elegibles documentos donde ese código aparezca literalmente en titulo/descripción/topicos/flujos,\n"
+            "   o un sinónimo directo inequívoco, por ejemplo MAAS = 'máxima asistencia'.\n"
+            "2) Restricciones explícitas del enunciado: si la pregunta menciona canal, herramienta, sistema, país,\n"
+            "   producto, normativa, mercado, rol o sigla operativa, esa mención debe aparecer o estar claramente implicada.\n"
+            "   Para eventos amplios como atraso, cancelación, cambio involuntario o contingencia, trátalos como contexto,\n"
+            "   salvo que la pregunta pida explícitamente el procedimiento general de ese evento.\n"
+            "3) Si la pregunta exige un canal concreto, por ejemplo 'por email', penaliza fuerte documentos cuyo foco sea otro canal,\n"
+            "   por ejemplo WhatsApp, Chat o voz, y que NO mencionen el canal solicitado.\n"
+            "4) Si la pregunta incluye 2 o más condiciones, gana el documento que cumpla MÁS condiciones simultáneamente,\n"
+            "   aunque otro documento sea muy fuerte en solo una de ellas.\n"
+            "5) Si 'topicos no cubiertos' declara que NO cubre una restricción explícita, descártalo o penalízalo al máximo.\n"
+            "6) Si la pregunta menciona explícitamente una normativa/mercado/rol o sigla operativa, por ejemplo\n"
+            "   'Código de Consumo PE', 'PE/Perú', 'no show', 'LUA', 'HVC', SOLO son elegibles documentos que mencionen literalmente\n"
+            "   esa misma señal en titulo/descripción/topicos/flujos/intents, o una variante obvia, por ejemplo 'Perú' para 'PE'.\n"
+            "   Si ningún documento menciona esas señales, elige el más cercano por intención y con menor conflicto en 'topicos no cubiertos'.\n"
+            "7) Si la pregunta contiene 'Staff travel' o 'consola', solo son elegibles docs que mencionen 'Staff travel'\n"
+            "   o el sistema/consola correspondiente. Si ninguno lo menciona, recién ahí cae al más cercano.\n\n"
 
-                "IMPORTANTE:\n"
-                "- No inventes información: decide SOLO con lo que aparece en los candidatos.\n"
-                "- Debes escoger un único id documento incluso si la cobertura es parcial.\n\n"
+            "HEURÍSTICA DE SELECCIÓN:\n"
+            "A) Primero elige el documento más alineado con la pregunta.\n"
+            "B) Luego, dentro de ese documento, elige los flujos que apoyen directamente la pregunta.\n"
+            "C) Si el título de un flujo coincide semánticamente con la pregunta, es fuerte candidato.\n"
+            "D) Si varios documentos parecen relevantes, elige el que tenga mejor combinación de descripción + topicos + intents + flujos.\n"
+            "E) Si ninguno responde perfectamente, elige el MÁS cercano con mejor cobertura parcial y menor conflicto.\n\n"
 
-                f"PREGUNTA DEL USUARIO:\n{question}\n\n"
-                "DOCUMENTOS CANDIDATOS (formato fijo):\n"
-                "Cada candidato aparece como:\n"
-                "Documento X:\n"
-                "  -id: <id>\n"
-                "  -title: <title>\n"
-                "  -description: <description>\n"
-                "  -topics: <topics>\n"
-                "  -sample:\n"
-                "    <sample>\n"
-                "  -not covered: <not_covered>\n\n"
-                "  -intents: <not_covered>\n"
-                f"{docs_text}\n\n"
+            "EJEMPLOS DE SALIDA:\n"
+            "- Pregunta: '¿como es la accion o flujo de exceso en equipaje?'\n"
+            "- Documento elegido: 2\n"
+            "- Flujos relevantes dentro del documento:\n"
+            "  1) Flujo Emisión Exceso de Equipaje\n"
+            "  2) Flujo Emisión Oversize de Equipaje\n"
+            "- Respuesta correcta si solo aplica exceso de equipaje: (2)[1]\n"
+            "- Respuesta correcta si aplican exceso y oversize: (2)[1,2]\n\n"
 
-                "RESPUESTA (SOLO EL id DEL DOCUMENTO ELEGIDO):"
-            )
-        chosen_id = _invoke_chat(SONNET_45_MODEL_ID, prompt_chunks, max_tokens=10, temperature=0.0).strip()
-        print("CHOSEN ID - IA: ", chosen_id)
-        
+            "IMPORTANTE:\n"
+            "- No inventes IDs.\n"
+            "- No inventes números de flujo.\n"
+            "- No expliques tu decisión.\n"
+            "- No devuelvas títulos de flujos, solo sus números.\n"
+            "- La númeración de flujos se reinicia (vuelve a 1) por cada documento"
+            "- Debes escoger un único documento incluso si la cobertura es parcial.\n\n"
+
+            f"PREGUNTA DEL USUARIO:\n{question}\n\n"
+
+            "DOCUMENTOS CANDIDATOS (formato fijo):\n"
+            "Cada candidato aparece como:\n"
+            "Documento X:\n"
+            "  -id: <id>\n"
+            "  -titulo: <titulo>\n"
+            "  -descripción: <descripción>\n"
+            "  -Flujos:\n"
+            "    1) <titulo_flujo_1>\n"
+            "    2) <titulo_flujo_2>\n"
+            "    3) <titulo_flujo_3>\n"
+            "  -topicos: <topicos>\n"
+            "  -topicos no cubiertos (excluyente): <not_covered>\n"
+            "  -intents: <intents>\n\n"
+
+            f"{docs_text}\n\n"
+
+            "RESPUESTA OBLIGATORIA, SOLO EN FORMATO (<id_documento>)[<numeros_de_flujo_seleccionado>]:"
+        )
+        respuesta_ia = _invoke_chat(SONNET_45_MODEL_ID, prompt_chunks, max_tokens=100, temperature=0.0).strip()
+    
+        chosen_id, chosen_flujos = parsear_respuesta_ia(respuesta_ia)
+
+        print(prompt_chunks)
+
+        print("CHOSEN DOC ID - IA:", chosen_id)
+        print("CHOSEN FLUJOS - IA:", chosen_flujos)
+    
         chosen_candidate = next((c for c in candidate_docs if c["id"] == chosen_id), None)
 
         if not chosen_candidate:
@@ -1433,7 +1827,6 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
             chosen_candidate = candidate_docs[0]
             
         selected_doc = chosen_candidate["doc"]
-        print("SELECCIÓN IA")
 
     print("---------")
     print(f"ARTICULO A UTILIZAR:")
@@ -1445,8 +1838,10 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     print("***********************************************************")
     t5 = tstart()
     print(f"----------INICIO - INYECCIÓN DEPENDENCIAS----------")
+
     title_to_show = selected_doc.get("title", "Título no encontrado")
-    print("Title to show: ",title_to_show)
+    print("Title to show:", title_to_show)
+
     raw = selected_doc.get("raw", {})  # chunk original de Bedrock
 
     rag_files = (
@@ -1455,7 +1850,6 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         .get('uri', '')
         .replace(CONFIG.s3_files_prefix, '')
     )
-    print("rg:",rag_files)
 
     sel_text = (
         raw.get('content', {})
@@ -1464,44 +1858,71 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
 
     meta = raw.get('metadata', {})
 
-    uris = meta.get('tablas', []) + meta.get('flujos', [])
+    print("Sel_text original:")
+    print(sel_text)
 
-    glosario_uris = meta.get('glosario', [])
 
-    links = meta.get('urls', [])
-    links = normalizar_links(links)
-    links = convertir_links_a_html(links)
+    # =====================================================
+    # RESCATAR FLUJOS SELECCIONADOS POR LA IA
+    # =====================================================
+
+    selected_flows = obtener_flujos_seleccionados(meta, chosen_flujos)
+
+    print("Flujos seleccionados metadata:")
+    print(selected_flows)
+
+    selected_flow_urls_norm = {
+        flujo["url_norm"]
+        for flujo in selected_flows
+        if flujo.get("url_norm")
+    }
+
+    selected_flow_titles_norm = {
+        flujo.get("titulo_norm") or normalizar_texto_para_match(flujo.get("titulo", ""))
+        for flujo in selected_flows
+        if flujo.get("titulo_norm") or flujo.get("titulo")
+    }
+
+    print("Selected flow URLs norm:")
+    print(selected_flow_urls_norm)
+
+    print("Selected flow titles norm:")
+    print(selected_flow_titles_norm)
+
+
+    # =====================================================
+    # LINKS HTML SOLO DE FLUJOS SELECCIONADOS
+    # =====================================================
+
+    links_seleccionados = [
+        f"{flujo['url']};{flujo['titulo']}"
+        for flujo in selected_flows
+    ]
+
+    print("Links seleccionados raw:")
+    print(links_seleccionados)
+
+    links = convertir_links_a_html(links_seleccionados)
+
+    print("Links seleccionados HTML:")
+    print(links)
+
+
+    # =====================================================
+    # METADATA RESPONSE
+    # =====================================================
 
     metadata_response = {
         "tablas": meta.get("tablas", []),
         "flujos": meta.get("flujos", []),
     }
-    
-    metadata_list = []
-    uri_to_content: Dict[str, str] = {}
 
-    for uri in uris:
-        try:
-            raw_txt, used_uri = fetch_with_fallback(uri)
-            txt = normalize_text(raw_txt)
-            full_uri = normalize_s3_uri(used_uri)
 
-            metadata_list.append({
-                "uri": full_uri,
-                "content": txt
-            })
-            uri_to_content[full_uri] = txt
+    # =====================================================
+    # GLOSARIO
+    # =====================================================
 
-        except Exception:
-            candidates = _build_s3_candidates(uri)
-            fallback_uri = normalize_s3_uri(candidates[-1] if candidates else uri)
-            metadata_list.append({
-                "uri": fallback_uri,
-                "content": "No encontrado: " + fallback_uri
-            })
-            continue
-
-    print("Metadata List: ",metadata_list)
+    glosario_uris = meta.get('glosario', []) or []
 
     glosario_str = ""
 
@@ -1514,44 +1935,116 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         except Exception:
             glosario_str += f"No encontre contenido en glosario: {uri}\n"
             continue
-    
-    print("Glosario",glosario_str)
 
-    short_to_full = {}
-    normalized_prefix = normalize_s3_uri(S3_PREFIX).rstrip("/")
-    for full_uri in uri_to_content.keys():
-        if full_uri.startswith(normalized_prefix):
-            short_key = full_uri[len(normalized_prefix):].lstrip("/")
-            short_to_full[short_key] = full_uri
 
-    # --- Reemplazo en sel_text ---
-    # Captura [TABLA] o [FLUJO] seguido de una URI/token hasta espacio o salto de línea.
-    pattern = re.compile(
-        r'\[(TABLA|FLUJO)\]\s*([^\s]+)',
-        flags=re.IGNORECASE | re.UNICODE
+    # =====================================================
+    # FASE 1: INYECTAR SOLO TABLAS
+    # =====================================================
+
+    print("----------FASE 1 - INYECCIÓN TABLAS----------")
+
+    tablas_uris = meta.get('tablas', []) or []
+
+    print("TABLAS URIS desde metadata:")
+    print(tablas_uris)
+
+    metadata_tablas, uri_to_content_tablas = cargar_dependencias(tablas_uris)
+
+    print("Metadata tablas:")
+    print(metadata_tablas)
+
+    context_text = inyectar_dependencias_por_tipo(
+        texto=sel_text,
+        uri_to_content=uri_to_content_tablas,
+        tipo="TABLA"
     )
-    print("Sel_text articulo:",sel_text)
 
-    def replace_match(m: re.Match) -> str:
-        kind = m.group(1).upper()
-        uri_raw = m.group(2)
+    print("Texto después de inyectar TABLAS:")
+    print(context_text)
 
-        uri_norm = normalize_s3_uri(uri_raw)
-        full_uri = uri_norm
-        if not full_uri.startswith("s3://"):
-            full_uri = short_to_full.get(uri_norm) or normalize_s3_uri(f"{S3_PREFIX.rstrip('/')}/{uri_norm.lstrip('/')}")
 
-        content = uri_to_content.get(full_uri, "")
+    # =====================================================
+    # FASE 2: FILTRAR FLUJOS NO SELECCIONADOS
+    # SOBRE EL TEXTO RESULTANTE DE TABLAS
+    # =====================================================
 
-        if not content:
-            return f'[{kind}] {full_uri} [NO ENCONTRADO EN METADATA]'
+    print("----------FASE 2 - FILTRO FLUJOS SELECCIONADOS----------")
 
-        fin_tag = end_tag_for_uri(full_uri, kind)
-        return f'[{kind}]{{ {content} }} [{fin_tag}]'
+    print("Texto ANTES de filtrar FLUJOS:")
+    print(context_text)
 
-    context_text = pattern.sub(replace_match, sel_text)
+    context_text = filtrar_flujos_no_seleccionados_en_texto(
+        sel_text=context_text,
+        selected_flow_urls_norm=selected_flow_urls_norm,
+        selected_flow_titles_norm=selected_flow_titles_norm
+    )
 
-    context_text = "Glosario: "+glosario_str + "Artículo: "+context_text
+    print("Texto DESPUÉS de filtrar FLUJOS no seleccionados:")
+    print(context_text)
+
+
+    # =====================================================
+    # FASE 3: EXTRAER FLUJOS DESPUÉS DE INYECTAR TABLAS
+    # =====================================================
+
+    print("----------FASE 3 - EXTRACCIÓN FLUJOS POST-TABLAS----------")
+
+    flujos_uris = extraer_uris_por_tipo(
+        texto=context_text,
+        tipo="FLUJO"
+    )
+
+    print("FLUJOS URIS encontrados después de inyectar tablas y filtrar:")
+    print(flujos_uris)
+
+
+    # =====================================================
+    # FASE 4: INYECTAR SOLO FLUJOS SELECCIONADOS
+    # =====================================================
+
+    print("----------FASE 4 - INYECCIÓN FLUJOS----------")
+
+    metadata_flujos, uri_to_content_flujos = cargar_dependencias(flujos_uris)
+
+    print("Metadata flujos:")
+    print(metadata_flujos)
+
+    context_text = inyectar_dependencias_por_tipo(
+        texto=context_text,
+        uri_to_content=uri_to_content_flujos,
+        tipo="FLUJO"
+    )
+
+    print("Texto final después de inyectar FLUJOS:")
+    print(context_text)
+
+
+    # =====================================================
+    # METADATA LIST FINAL
+    # =====================================================
+
+    metadata_list = metadata_tablas + metadata_flujos
+
+    uri_to_content: Dict[str, str] = {}
+
+    for item in metadata_list:
+        uri_norm = normalize_s3_uri(item.get("uri", ""))
+        content = item.get("content", "") or ""
+        uri_to_content[uri_norm] = content
+
+    print("Metadata List final:")
+    print(metadata_list)
+
+
+    # =====================================================
+    # CONTEXTO FINAL
+    # =====================================================
+
+    context_text = "Glosario: " + glosario_str + "Artículo: " + context_text
+
+    print("Context text final:")
+    print(context_text)
+    # print(f"----------INICIO - INYECCIÓN DEPENDENCIAS----------")
 
     mark(execution_times, 'loadChunk', t5)
     print(f"----------FIN - INYECCIÓN DEPENDENCIAS----------")
@@ -1611,7 +2104,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         "\n"
     )
     try:
-        MAX_RETRIES = 3
+        MAX_RETRIES = 7
 
         full_answer = None
         timed_out = False
@@ -1671,18 +2164,22 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         # Normalización ligera de saltos HTML
         full_answer_norm = re.sub(r'(?i)<br\s*/?>', '\n', full_answer or "")
 
+        # Patrones reutilizables
+        RESUMEN_RE = r'(?:RESUMEN|RESUMÉN|RESUMN|RESUME)'
+        ADICIONAL_RE = r'(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales|additional)'
+
         # ======== RESUMEN ========
         m = re.search(
-            r'''
-            \[\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*\]\s*
+            rf'''
+            \[\s*{RESUMEN_RE}\s*\]\s*
             (.*?)                                                     # contenido
             \s*
             (?=
                 \[
-                /\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*
+                /\s*{RESUMEN_RE}\s*
                 \]
                 |
-                \[\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]
+                \[\s*{ADICIONAL_RE}\s*\]
                 |
                 $
             )
@@ -1693,16 +2190,16 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
             resumen = m.group(1).strip()
         else:
             m = re.search(
-                r'''
-                <\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*>\s*
+                rf'''
+                <\s*{RESUMEN_RE}\s*>\s*
                 (.*?)                                                 # contenido
                 \s*
                 (?=
-                    </\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*>
+                    </\s*{RESUMEN_RE}\s*>
                     |
                     </\s*>
                     |
-                    \[\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]
+                    \[\s*{ADICIONAL_RE}\s*\]
                     |
                     $
                 )
@@ -1715,17 +2212,16 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 m = re.search(r'<\s*([^<>]+?)\s*>', full_answer_norm, flags=re.DOTALL)
                 if m:
                     inner = m.group(1).strip()
-                    # No tomar etiquetas <RESUMEN> (y variantes) como contenido
                     if inner.upper() not in ("RESUMEN", "RESUMÉN", "RESUMN", "RESUME"):
                         resumen = inner
 
         # ======== INFO_ADICIONAL ========
         m = re.search(
-            r'''
-            \[\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]\s*:?\s*
+            rf'''
+            \[\s*{ADICIONAL_RE}\s*\]\s*:?\s*
             (.*?)                                    # contenido
             \s*
-            \[\s*/\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]
+            \[\s*/\s*{ADICIONAL_RE}\s*\]
             ''',
             full_answer_norm, flags=re.IGNORECASE | re.DOTALL | re.UNICODE | re.VERBOSE
         )
@@ -1733,13 +2229,13 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
             info_adicional = m.group(1).strip()
         else:
             m = re.search(
-                r'''
-                \[\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]\s*:?\s*
+                rf'''
+                \[\s*{ADICIONAL_RE}\s*\]\s*:?\s*
                 (.*?)                                 # contenido
                 \s*
                 (?=
-                    </\s*(?:adicional|adicial)\s*>       # </ADICIONAL> o </ADICIAL>
-                    | \[/\s*(?:adicional|adicial)\s*\]   # [/ADICIONAL] o [/ADICIAL]
+                    </\s*{ADICIONAL_RE}\s*>
+                    | \[/\s*{ADICIONAL_RE}\s*\]
                     | $
                 )
                 ''',
@@ -1752,40 +2248,38 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 if m2:
                     candidate = m2.group(1).strip()
                     if not re.fullmatch(
-                        r'(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)',
+                        ADICIONAL_RE,
                         candidate,
                         flags=re.IGNORECASE
                     ):
                         info_adicional = candidate
 
-        # ======== RECUPERACIÓN PARA CASO MALFORMADO: <RESUMEN> ... [/ADICIONAL] ... ========
+        # ======== RECUPERACIÓN PARA CASO MALFORMADO: <RESUMEN> ... [/ADICIONAL] / [/ADDITIONAL] ... ========
         try:
-            closing_add_re = r'\[/\s*(?:informaci[oó]n\s+adicional|informaci[oó]n\s+adicial|adicional|adicial|detalles\s+adicionales|detalles\s+adiciales)\s*\]'
-            opening_res_re = r'<\s*(?:RESUMEN|RESUMÉN|RESUMN|RESUME)\s*>'
+            closing_add_re = rf'\[/\s*{ADICIONAL_RE}\s*\]'
+            opening_res_re = rf'<\s*{RESUMEN_RE}\s*>'
 
             if not info_adicional:
                 text = full_answer_norm or ""
 
-                # Caso A: el RESUMEN quedó con un [/ADICIONAL] o [/ADICIAL] dentro (contaminado)
+                # Caso A: el RESUMEN quedó con un cierre [/ADICIONAL] o [/ADDITIONAL] dentro
                 if resumen and re.search(closing_add_re, resumen, flags=re.IGNORECASE):
                     parts = re.split(closing_add_re, resumen, maxsplit=1, flags=re.IGNORECASE)
                     resumen = (parts[0] or "").strip()
                     tail = (parts[1] if len(parts) > 1 else "").strip()
 
-                    # Quitar un segundo cierre si aparece al final
                     tail = re.sub(closing_add_re + r'\s*$', "", tail, flags=re.IGNORECASE).strip()
 
                     if tail:
                         info_adicional = tail
 
-                # Caso B: existe <RESUMEN> y uno o más cierres [/ADICIONAL] o [/ADICIAL] sin apertura
+                # Caso B: existe <RESUMEN> y uno o más cierres [/ADICIONAL] o [/ADDITIONAL] sin apertura
                 if not info_adicional and re.search(opening_res_re, text, flags=re.IGNORECASE) and re.search(closing_add_re, text, flags=re.IGNORECASE):
                     after_resumen = re.split(opening_res_re, text, maxsplit=1, flags=re.IGNORECASE)[1]
                     before_close, *rest = re.split(closing_add_re, after_resumen, maxsplit=1, flags=re.IGNORECASE)
                     cand_resumen = (before_close or "").strip()
                     cand_tail = (rest[0] if rest else "").strip()
 
-                    # Limpiar un posible segundo cierre al final del tail
                     cand_tail = re.sub(closing_add_re + r'\s*$', "", cand_tail, flags=re.IGNORECASE).strip()
 
                     if cand_resumen and (not resumen or resumen.upper() in ("RESUMEN", "RESUMÉN", "RESUMN", "RESUME")):
@@ -1819,7 +2313,8 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
             else:
                 resumen += '<br><br> <b>Fuente:</b> '+title_to_show
         else:
-            resumen = "Intermitencia de Servicio"
+            resumen = "No encontrado en Información"
+            
         print("*****************RESUMEN*************************")
         print(resumen)
         print("*****************FIN RESUMEN*************************")
@@ -1886,7 +2381,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
             resumen = error_msg
         if not raw_additional.strip() or raw_additional.strip() == '[]':
             raw_additional = error_msg
-            raw_additional_cleaned = error_msg
+            raw_additional_clean = error_msg
         if resumen == 'No encontrado en Información':
             raw_additional_clean = 'No encontrado en Información'
 
