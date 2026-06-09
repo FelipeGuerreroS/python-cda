@@ -1525,7 +1525,7 @@ def rerank_candidate_document(
     excluded_doc_id: Optional[str] = None,
 ) -> Tuple[Optional[dict], List[int], str, str]:
     docs_text, eligible_candidates = build_docs_text_for_reranking(candidate_docs, excluded_doc_id)
-    print(docs_text)
+    print("[SELECCION] documentos_candidatos:", docs_text, sep="\n")
 
     if not eligible_candidates:
         return None, [], "", docs_text
@@ -1549,7 +1549,7 @@ def rerank_candidate_document(
 
 def prepare_selected_doc_payload(selected_doc: dict, chosen_flujos: List[int]) -> dict:
     title_to_show = selected_doc.get("title", "Título no encontrado")
-    print("Title to show:", title_to_show)
+    print("[DEPENDENCIAS] title_to_show:", title_to_show)
 
     raw = selected_doc.get("raw", {}) or {}
 
@@ -1567,12 +1567,12 @@ def prepare_selected_doc_payload(selected_doc: dict, chosen_flujos: List[int]) -
 
     meta = raw.get('metadata', {})
 
-    print("Sel_text original:")
+    print("[DEPENDENCIAS] sel_text_original:")
     print(sel_text)
 
     selected_flows = obtener_flujos_seleccionados(meta, chosen_flujos)
 
-    print("Flujos seleccionados metadata:")
+    print("[DEPENDENCIAS] flujos_seleccionados_metadata:")
     print(selected_flows)
 
     selected_flow_urls_norm = {
@@ -1587,10 +1587,10 @@ def prepare_selected_doc_payload(selected_doc: dict, chosen_flujos: List[int]) -
         if flujo.get("titulo_norm") or flujo.get("titulo")
     }
 
-    print("Selected flow URLs norm:")
+    print("[DEPENDENCIAS] selected_flow_urls_norm:")
     print(selected_flow_urls_norm)
 
-    print("Selected flow titles norm:")
+    print("[DEPENDENCIAS] selected_flow_titles_norm:")
     print(selected_flow_titles_norm)
 
     links_seleccionados = [
@@ -1598,12 +1598,12 @@ def prepare_selected_doc_payload(selected_doc: dict, chosen_flujos: List[int]) -
         for flujo in selected_flows
     ]
 
-    print("Links seleccionados raw:")
+    print("[DEPENDENCIAS] links_seleccionados_raw:")
     print(links_seleccionados)
 
     links = convertir_links_a_html(links_seleccionados)
 
-    print("Links seleccionados HTML:")
+    print("[DEPENDENCIAS] links_seleccionados_html:")
     print(links)
 
     metadata_response = {
@@ -1992,22 +1992,22 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     """
     t0 = tstart()
     execution_times = {}
-    print(f"----------INICIO - EVENTO RECIBIDO----------")
+    print("========== EVENTO RECIBIDO ==========")
     print(f"{event}")
-    print(f"----------FIN - EVENTO RECIBIDO----------")
+    print("======== FIN EVENTO RECIBIDO ========")
     print("***********************************************************")
     data, perr = parse_request(event)
 
     question = (data or {}).get('question')
-    print(f"PREGUNTA: ",question)
+    print("[REQUEST] pregunta:", question)
     session_id = (data or {}).get('session_id')
-    print(f"ID DE INTERACCIÓN: ",session_id)
+    print("[REQUEST] id_interaccion:", session_id)
     language = (data or {}).get('language') or 'español'
-    print(f"IDIOMA: ",language)
+    print("[REQUEST] idioma:", language)
     name = (data or {}).get('name')
-    print(f"NOMBRE AGENTE: ",name)
+    print("[REQUEST] nombre_agente:", name)
     email = (data or {}).get('email')
-    print(f"EMAIL: ",email)
+    print("[REQUEST] email:", email)
 
     if not question:
         print("No 'question' in body")
@@ -2018,7 +2018,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     
     mark(execution_times, 'eventParser', t0)
     t1 = tstart()
-    print(f"----------INICIO - RECUPERACION HISTORIAL----------")
+    print("========== INICIO - RECUPERACION HISTORIAL ==========")
     item = None
     if session_id:
         try:
@@ -2030,10 +2030,10 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         session_id = str(uuid.uuid4())
     history = item.get('history', []) if item else []
     mark(execution_times, 'getUserHistory', t1)
-    print(f"----------FIN - RECUPERACION HISTORIAL----------")
+    print("========== FIN - RECUPERACION HISTORIAL ==========")
     print("***********************************************************")
     t2 = tstart()
-    print(f"----------INICIO - REFRASEO PREGUNTA----------")
+    print("========== INICIO - REFRASEO PREGUNTA ==========")
     rephrase_context = [question] ##history[-2:] + [question]
     rephrase_prompt = (
         "Contexto:\n"
@@ -2052,28 +2052,27 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     except Exception:
         rephrased = question
 
-    print(f"PREGUNTA: ",question)
-    print(f"REFRASEO: ",rephrased)
+    print("[REFRASEO] pregunta_original:", question)
+    print("[REFRASEO] pregunta_refraseada:", rephrased)
     mark(execution_times, 'rephrase_totalTime', t2)
-    print(f"----------FIN - REFRASEO PREGUNTA----------")
+    print("========== FIN - REFRASEO PREGUNTA ==========")
     print("***********************************************************")
     t3 = tstart()
-    print(f"----------INICIO - RETRIEVE DOCS----------")
+    print("========== INICIO - RETRIEVE DOCS ==========")
     category = "Sin categoría"
     rephrased_chunks = []
     try:
         rephrased_chunks = retrieve_kb(rephrased, language)
         rephrased_chunks = normalize_results(rephrased_chunks, "rephrased")
-        print(f"CHUNK REPHRASED")
-        print("---------------")
+        print("[RETRIEVE] chunks_rephrased:", len(rephrased_chunks))
     except Exception:
         rephrased_chunks = []
 
     mark(execution_times, 'categorizationAndRag', t3)
-    print(f"----------FIN - RETRIEVE DOCS----------")
+    print("========== FIN - RETRIEVE DOCS ==========")
     print("***********************************************************")
     t4 = tstart()
-    print(f"----------INICIO - SELECCIÓN ARTICULO----------")
+    print("========== INICIO - SELECCIÓN ARTICULO ==========")
     merged_docs = merge_results([], rephrased_chunks)
     candidate_docs = build_llm_candidates_payload(merged_docs, max_candidates=15)
     docs_text = ""
@@ -2090,7 +2089,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
 
         urls_originales = metadata.get("urls", [])
         urls = [url for url in urls_originales if "lucid.app" in url]
-        print("urls: ",urls)
+        print("[SELECCION] urls_lucid:", urls)
         titulos_links = extraer_titulos_links(urls)
 
         if titulos_links:
@@ -2217,32 +2216,29 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     
         chosen_id, chosen_flujos = parsear_respuesta_ia(respuesta_ia)
 
-        print(prompt_chunks)
-
-        print("CHOSEN DOC ID - IA:", chosen_id)
-        print("CHOSEN FLUJOS - IA:", chosen_flujos)
+        print("[SELECCION] prompt_reranking:", prompt_chunks, sep="\n")
+        print("[SELECCION] chosen_doc_id_ia:", chosen_id)
+        print("[SELECCION] chosen_flujos_ia:", chosen_flujos)
     
         chosen_candidate = next((c for c in candidate_docs if c["id"] == chosen_id), None)
 
         if not chosen_candidate:
-            print("No se encontró candidato para ese id, fallback a primero")
+            print("[SELECCION] No se encontró candidato para ese id; fallback a primero")
             chosen_candidate = candidate_docs[0]
             
         selected_doc = chosen_candidate["doc"]
 
-    print("---------")
-    print(f"ARTICULO A UTILIZAR:")
+    print("[SELECCION] articulo_a_utilizar:")
     print(f"{selected_doc}")
-    print("---------")
 
     mark(execution_times, 'chunkSelection_totalTime', t4)
-    print(f"----------FIN - SELECCIÓN ARTICULO----------")
+    print("========== FIN - SELECCIÓN ARTICULO ==========")
     print("***********************************************************")
     t5 = tstart()
-    print(f"----------INICIO - INYECCIÓN DEPENDENCIAS----------")
+    print("========== INICIO - INYECCIÓN DEPENDENCIAS ==========")
 
     title_to_show = selected_doc.get("title", "Título no encontrado")
-    print("Title to show:", title_to_show)
+    print("[DEPENDENCIAS] title_to_show:", title_to_show)
 
     raw = selected_doc.get("raw", {})  # chunk original de Bedrock
 
@@ -2260,7 +2256,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
 
     meta = raw.get('metadata', {})
 
-    print("Sel_text original:")
+    print("[DEPENDENCIAS] sel_text_original:")
     print(sel_text)
 
 
@@ -2270,7 +2266,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
 
     selected_flows = obtener_flujos_seleccionados(meta, chosen_flujos)
 
-    print("Flujos seleccionados metadata:")
+    print("[DEPENDENCIAS] flujos_seleccionados_metadata:")
     print(selected_flows)
 
     selected_flow_urls_norm = {
@@ -2285,10 +2281,10 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         if flujo.get("titulo_norm") or flujo.get("titulo")
     }
 
-    print("Selected flow URLs norm:")
+    print("[DEPENDENCIAS] selected_flow_urls_norm:")
     print(selected_flow_urls_norm)
 
-    print("Selected flow titles norm:")
+    print("[DEPENDENCIAS] selected_flow_titles_norm:")
     print(selected_flow_titles_norm)
 
 
@@ -2301,12 +2297,12 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         for flujo in selected_flows
     ]
 
-    print("Links seleccionados raw:")
+    print("[DEPENDENCIAS] links_seleccionados_raw:")
     print(links_seleccionados)
 
     links = convertir_links_a_html(links_seleccionados)
 
-    print("Links seleccionados HTML:")
+    print("[DEPENDENCIAS] links_seleccionados_html:")
     print(links)
 
 
@@ -2449,13 +2445,13 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     # print(f"----------INICIO - INYECCIÓN DEPENDENCIAS----------")
 
     mark(execution_times, 'loadChunk', t5)
-    print(f"----------FIN - INYECCIÓN DEPENDENCIAS----------")
+    print("========== FIN - INYECCIÓN DEPENDENCIAS ==========")
     print("***********************************************************")
     t6 = tstart()
-    print(f"----------INICIO - GENERAR RESPUESTA----------")
+    print("========== INICIO - GENERAR RESPUESTA ==========")
     articulo = context_text
     
-    print("LEN ARTICULO: ",len(articulo))
+    print("[GENERAR_RESPUESTA] len_articulo:", len(articulo))
     print(articulo)
 
     answer_prompt = (
@@ -2538,14 +2534,14 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 full_answer = (full_answer or "")
                 full_answer, reasoning_blocks = split_reasoning_blocks(full_answer)
                 reasoning_text = "\n\n".join(reasoning_blocks)
-                print("Razonamiento: ",reasoning_text)
-                print("Answer: ",full_answer)
+                print("[GENERAR_RESPUESTA] razonamiento:", reasoning_text)
+                print("[GENERAR_RESPUESTA] answer:", full_answer)
                 
 
                 if full_answer == "NOT FOUND":
                     not_found_rerank_attempted = True
                     initial_doc_id = get_doc_unique_id(selected_doc)
-                    print("NOT FOUND en primer documento. Reintentando re-ranking sin el documento inicial:", initial_doc_id)
+                    print("[GENERAR_RESPUESTA] NOT FOUND en primer documento; reintentando sin doc_id:", initial_doc_id)
 
                     retry_candidate, retry_chosen_flujos, retry_prompt_chunks, retry_docs_text = rerank_candidate_document(
                         candidate_docs,
@@ -2560,10 +2556,8 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                     selected_doc = retry_candidate["doc"]
                     chosen_flujos = retry_chosen_flujos
 
-                    print("---------")
-                    print("ARTICULO A UTILIZAR EN REINTENTO:")
+                    print("[GENERAR_RESPUESTA] articulo_a_utilizar_en_reintento:")
                     print(f"{selected_doc}")
-                    print("---------")
 
                     retry_payload = prepare_selected_doc_payload(selected_doc, chosen_flujos)
                     title_to_show = retry_payload["title_to_show"]
@@ -2578,7 +2572,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                     articulo = retry_payload["articulo"]
                     answer_prompt = build_answer_prompt(question, language, articulo)
 
-                    print("LEN ARTICULO REINTENTO: ", len(articulo))
+                    print("[GENERAR_RESPUESTA] len_articulo_reintento:", len(articulo))
                     print(articulo)
 
                     full_answer, timed_out = _invoke_chat_with_timeout(
@@ -2590,8 +2584,8 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                     full_answer = (full_answer or "")
                     full_answer, reasoning_blocks = split_reasoning_blocks(full_answer)
                     reasoning_text = "\n\n".join(reasoning_blocks)
-                    print("Razonamiento: ",reasoning_text)
-                    print("Answer: ",full_answer)
+                    print("[GENERAR_RESPUESTA] razonamiento_reintento:", reasoning_text)
+                    print("[GENERAR_RESPUESTA] answer_reintento:", full_answer)
 
                     if full_answer == "NOT FOUND":
                         full_answer = localized_not_found_message(language)
@@ -2620,16 +2614,15 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     except Exception:
         full_answer = "Intermitencia de Servicio"
 
-    print("FULL ANSWER",full_answer)
-    print("--------------------")
-    print("prompt qna:",answer_prompt)
+    print("[GENERAR_RESPUESTA] full_answer:", full_answer)
+    print("[GENERAR_RESPUESTA] prompt_qna:", answer_prompt)
 
     mark(execution_times, 'generateAnswer_totalTime', t6)
-    print(f"----------FIN - GENERAR RESPUESTA----------")
+    print("========== FIN - GENERAR RESPUESTA ==========")
     print("***********************************************************")
     if not timed_out:
         t7 = tstart()
-        print("----------INICIO - PARSEAR RESUMEN Y INFO ADICIONAL----------")
+        print("========== INICIO - PARSEAR RESUMEN Y INFO ADICIONAL ==========")
         resumen = ""
         info_adicional = ""
 
@@ -2787,13 +2780,11 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         else:
             resumen = localized_not_found_message(language)
             
-        print("*****************RESUMEN*************************")
+        print("[PARSE_ANSWER] resumen:")
         print(resumen)
-        print("*****************FIN RESUMEN*************************")
         # Limpieza Info Adicional para Frontal
-        print("*****************INFO ADICIONAL*************************")
+        print("[PARSE_ANSWER] info_adicional:")
         print(info_adicional)
-        print("*****************FIN INFO ADICIONAL*************************")
         raw_additional = format_to_html(info_adicional)
         raw_additional = clean_response_text(raw_additional)
 
@@ -2801,10 +2792,10 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         raw_additional_clean = clean_response_text(info_adicional)
 
         mark(execution_times, 'parseAnswer', t7)
-        print(f"----------FIN - PARSEAR RESUMEN Y INFO ADICIONAL----------")
+        print("========== FIN - PARSEAR RESUMEN Y INFO ADICIONAL ==========")
         t8 = tstart()
         print("*************************************************************")
-        print(f"----------INICIO - GUARDAR HISTORIAL----------")
+        print("========== INICIO - GUARDAR HISTORIAL ==========")
         now_santiago = datetime.now(ZoneInfo("America/Santiago")).isoformat()
         total_time = round(sum(execution_times.values()), 2)
         question_item = {
@@ -2828,10 +2819,10 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
         except ClientError as e:
             print(f"Error saving question: {e}")
         mark(execution_times, 'saveQuestion', t8)
-        print(f"----------FIN - GUARDAR PREGUNTA----------")
+        print("========== FIN - GUARDAR PREGUNTA ==========")
         print("*************************************************************")
         t9 = tstart()
-        print(f"----------INICIO - ACTUALIZAR HISTORIAL SESION ----------")
+        print("========== INICIO - ACTUALIZAR HISTORIAL SESION ==========")
         new_history = history + [question]
         conv_item = {
             'user_id': session_id,
@@ -2844,10 +2835,10 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
             print(f"Error updating history: {e}")
         
         mark(execution_times, 'saveHistory', t9)
-        print(f"-------------FIN - ACTUALIZAR HISTORIAL SESION -------------")
+        print("========== FIN - ACTUALIZAR HISTORIAL SESION ==========")
         print("*************************************************************")
         t10 = tstart()
-        print(f"----------INICIO - BUILD RESPONSE ----------")
+        print("========== INICIO - BUILD RESPONSE ==========")
         error_msg = localized_not_found_message(language)
         if not resumen.strip(): 
             resumen = error_msg
@@ -2872,6 +2863,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 "links": links,
                 "metadata": metadata_response,
                 "language": _normalize_language_filter(language),
+                "title_to_show": title_to_show,
             },
             "total_execution_time": total_time
         }
@@ -2905,6 +2897,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
                 "links": links,
                 "metadata": metadata_list,
                 "language": _normalize_language_filter(language),
+                "title_to_show": title_to_show,
             },
             "total_execution_time": total_time
         }
