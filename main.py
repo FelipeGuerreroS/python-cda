@@ -127,7 +127,7 @@ def load_config() -> Config:
         titan_premier_model_id=_require_env("TITAN_PREMIER_MODEL_ID"),
         titan_express_model_id=_require_env("TITAN_EXPRESS_MODEL_ID"),
         gpt_oss_120_model_id=_require_env("GPT_OSS_120_MODEL_ID"),
-        answer_max_tokens=_get_int_env("ANSWER_MAX_TOKENS", 6000),
+        answer_max_tokens=_get_int_env("ANSWER_MAX_TOKENS", 1800),
         guardrail_id=os.environ.get("GUARDRAIL_ID", "sdsuv2s4z9op"),
         guardrail_ver=os.environ.get("GUARDRAIL_VER", "DRAFT"),
         trace=os.environ.get("TRACE", "ENABLED"),
@@ -2773,12 +2773,13 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
             resumen = format_resumen(resumen)
             resumen = convertir_links_html(resumen)
             resumen = formatear_texto(resumen)
-            if _normalize_language_filter(language) == 'portugues':
-                resumen += '<br><br> <b>Fonte:</b> '+title_to_show
-            else:
-                resumen += '<br><br> <b>Fuente:</b> '+title_to_show
         else:
             resumen = localized_not_found_message(language)
+
+        if _normalize_language_filter(language) == 'portugues':
+            resumen += '<br><br> <b>Fonte:</b> '+title_to_show
+        else:
+            resumen += '<br><br> <b>Fuente:</b> '+title_to_show
             
         print("[PARSE_ANSWER] resumen:")
         print(resumen)
