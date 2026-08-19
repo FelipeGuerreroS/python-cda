@@ -526,6 +526,122 @@ def retrieve_kb(txt: str, language: Optional[str]) -> list[dict]:
     )
     return kb_resp.get("retrievalResults", [])
 
+def _retrieve_and_generate_model_arn(model_id: str) -> str:
+    if model_id.startswith("arn:"):
+        return model_id
+    return f"arn:aws:bedrock:{AWS_REGION}::foundation-model/{model_id}"
+
+
+def retrieve_and_generate_answer(
+    question: str,
+    language: Optional[str],
+    prompt_template: str,
+) -> dict:
+    """Retrieve Knowledge Base context and generate the grounded answer in one call."""
+    normalized_language = _normalize_language_filter(language)
+    metadata_filter = {
+        "equals": {
+            "key": "idioma",
+            "value": normalized_language,
+        }
+    }
+    return bedrock_agent.retrieve_and_generate(
+        input={"text": question},
+        retrieveAndGenerateConfiguration={
+            "type": "KNOWLEDGE_BASE",
+            "knowledgeBaseConfiguration": {
+                "knowledgeBaseId": KB_ID,
+                "modelArn": _retrieve_and_generate_model_arn(GPT_OSS_120_MODEL_ID),
+                "retrievalConfiguration": {
+                    "vectorSearchConfiguration": {
+                        "numberOfResults": CONFIG.kb_max_results,
+                        "overrideSearchType": CONFIG.kb_search_type,
+                        "filter": metadata_filter,
+                    }
+                },
+                "generationConfiguration": {
+                    "inferenceConfig": {
+                        "textInferenceConfig": {
+                            "maxTokens": ANSWER_MAX_TOKENS,
+                            "temperature": 0.0,
+                        }
+                    },
+                    "promptTemplate": {
+                        "textPromptTemplate": prompt_template,
+                    },
+                },
+            },
+        },
+    )
+
+
+def retrieve_and_generate_with_timeout(
+    question: str,
+    language: Optional[str],
+    prompt_template: str,
+    timeout_seconds: Optional[float] = None,
+) -> Tuple[Optional[dict], bool]:
+    result: Dict[str, Any] = {"value": None, "error": None}
+
+    def runner() -> None:
+        try:
+            result["value"] = retrieve_and_generate_answer(
+                question, language, prompt_template
+            )
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join(timeout_seconds or CONFIG.invoke_timeout_seconds)
+    if thread.is_alive():
+        return None, True
+    if result["error"] is not None:
+        print(f"[RetrieveAndGenerate Error] {result['error']}")
+        return None, True
+    return result["value"], False
+
+
+def extract_retrieve_and_generate_sources(response: Mapping[str, Any]) -> dict:
+    """Build the existing response metadata fields from RAG citations."""
+    references = []
+    for citation in response.get("citations", []) or []:
+        references.extend(citation.get("retrievedReferences", []) or [])
+
+    uris: List[str] = []
+    titles: List[str] = []
+    metadata_items: List[dict] = []
+    fragments: List[str] = []
+    links: List[str] = []
+    for reference in references:
+        location = reference.get("location", {}) or {}
+        uri = (location.get("s3Location", {}) or {}).get("uri", "")
+        metadata = reference.get("metadata", {}) or {}
+        content = (reference.get("content", {}) or {}).get("text", "")
+        title = metadata.get("title")
+        if uri and uri not in uris:
+            uris.append(uri)
+        if title and title not in titles:
+            titles.append(str(title))
+        if metadata:
+            metadata_items.append(metadata)
+        if content:
+            fragments.append(content)
+        for url in metadata.get("urls", []) or []:
+            if isinstance(url, str) and url.startswith("https://"):
+                links.append(url)
+
+    return {
+        "rag_files": ",".join(
+            uri.replace(CONFIG.s3_files_prefix, "") for uri in uris
+        ),
+        "title_to_show": ", ".join(titles) or "Fuente de Knowledge Base",
+        "metadata": metadata_items,
+        "fragments": "\n\n".join(fragments),
+        "links": convertir_links_a_html([f"{url};{url}" for url in dict.fromkeys(links)]),
+    }
+
+
 def normalizar_texto_para_match(texto: str) -> str:
     if not texto:
         return ""
@@ -2058,568 +2174,53 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict:
     print("========== FIN - REFRASEO PREGUNTA ==========")
     print("***********************************************************")
     t3 = tstart()
-    print("========== INICIO - RETRIEVE DOCS ==========")
+    print("========== INICIO - RETRIEVE AND GENERATE ==========")
     category = "Sin categoría"
-    rephrased_chunks = []
-    try:
-        rephrased_chunks = retrieve_kb(rephrased, language)
-        rephrased_chunks = normalize_results(rephrased_chunks, "rephrased")
-        print("[RETRIEVE] chunks_rephrased:", len(rephrased_chunks))
-    except Exception:
-        rephrased_chunks = []
+    answer_prompt = build_answer_prompt(question, language, "$search_results$")
+    full_answer = "Intermitencia de Servicio"
+    timed_out = False
+    rag_response: Mapping[str, Any] = {}
+
+    # Keep the response contract populated from RetrieveAndGenerate citations.
+    title_to_show = "Fuente de Knowledge Base"
+    rag_files = ""
+    articulo = ""
+    context_text = ""
+    links: List[str] = []
+    metadata_response: Any = []
+    metadata_list: List[dict] = []
+
+    for attempt in range(1, 8):
+        rag_response_value, timed_out = retrieve_and_generate_with_timeout(
+            rephrased, language, answer_prompt
+        )
+        if rag_response_value is not None:
+            rag_response = rag_response_value
+            full_answer = (rag_response.get("output", {}) or {}).get("text", "").strip()
+            if full_answer:
+                break
+        if attempt < 7:
+            print(f"[RetrieveAndGenerate] reintento {attempt + 1}/7")
+
+    if full_answer == "NOT FOUND":
+        full_answer = localized_not_found_message(language)
+
+    source_data = extract_retrieve_and_generate_sources(rag_response)
+    title_to_show = source_data["title_to_show"]
+    rag_files = source_data["rag_files"]
+    articulo = source_data["fragments"]
+    context_text = articulo
+    links = source_data["links"]
+    metadata_response = source_data["metadata"]
+    metadata_list = source_data["metadata"]
 
     mark(execution_times, 'categorizationAndRag', t3)
-    print("========== FIN - RETRIEVE DOCS ==========")
+    mark(execution_times, 'generateAnswer_totalTime', t3)
+    print("========== FIN - RETRIEVE AND GENERATE ==========")
     print("***********************************************************")
-    t4 = tstart()
-    print("========== INICIO - SELECCIÓN ARTICULO ==========")
-    merged_docs = merge_results([], rephrased_chunks)
-    candidate_docs = build_llm_candidates_payload(merged_docs, max_candidates=15)
-    docs_text = ""
-    for d in candidate_docs:
-        raw_doc = (d.get("doc") or {}).get("raw", {})
-        metadata = raw_doc.get("metadata") or {}
-
-        description = metadata.get("context_short", "No hay 'context_short'")
-        topics = metadata.get("context_bullets", "No hay 'context_bullets'")
-        topics_str = str(topics)
-        full_text = raw_doc.get("content", {}).get("text", "")
-        not_covered = metadata.get("not_covered", "No hay 'not_covered'")
-        intents = metadata.get("intents", "No hay 'intents'")
-
-        urls_originales = metadata.get("urls", [])
-        urls = [url for url in urls_originales if "lucid.app" in url]
-        print("[SELECCION] urls_lucid:", urls)
-        titulos_links = extraer_titulos_links(urls)
-
-        if titulos_links:
-            flujos_str = "\n".join(
-                f"    {i}) {titulo}"
-                for i, titulo in enumerate(titulos_links, start=1)
-            )
-        else:
-            flujos_str = "    No hay flujos"
-
-        docs_text += (
-            f"Documento {d['id']}:\n"
-            f"  -id: {d['id']}\n"
-            f"  -titulo: {d['title']}\n"
-            f"  -descripción: {description}\n"
-            f"  -Flujos:\n{flujos_str}\n"
-            f"  -topicos: {topics_str}\n"
-            f"  -topicos no cubiertos (excluyente): {not_covered}\n"
-            f"  -intents: {intents}\n"
-        )
-
-    print(docs_text)
-    if not candidate_docs:
-        selected_doc = {"title": "Título no encontrado", "raw": {}}
-    else:
-        prompt_chunks = (
-            "Eres un sistema de selección de documentos y flujos relacionados (retrieval re-ranking).\n"
-            "Tu tarea es elegir EXACTAMENTE 1 documento candidato que mejor responda la pregunta del usuario,\n"
-            "y además elegir el o los flujos de ese documento que apoyan directamente la respuesta.\n\n"
-
-            "REGLAS DE SALIDA (OBLIGATORIAS):\n"
-            "1) Debes responder ÚNICAMENTE con este formato:\n"
-            "   (<id_documento>)[<numeros_de_flujo_seleccionado>]\n"
-            "2) El id del documento va entre paréntesis.\n"
-            "3) Los números de los flujos seleccionados van entre corchetes.\n"
-            "4) Si aplica un solo flujo, responde por ejemplo: (2)[1]\n"
-            "5) Si aplican varios flujos, responde por ejemplo: (2)[1,2]\n"
-            "6) No incluyas ningún texto adicional: sin explicación, sin comillas, sin markdown, sin prefijos, sin saltos extra.\n"
-            "7) Debes elegir EXACTAMENTE 1 documento.\n"
-            "8) Debes elegir solo flujos existentes dentro del documento seleccionado.\n"
-            "9) Si el documento elegido no tiene ningún flujo claramente aplicable, responde con lista vacía, por ejemplo: (2)[]\n\n"
-
-            "CÓMO DECIDIR EL DOCUMENTO:\n"
-            "- Prioriza el documento que cubra MÁS directamente la pregunta del usuario.\n"
-            "- Usa 'titulo', 'descripción', 'topicos' e 'intents' para entender el tema general y el objetivo del documento.\n"
-            "- Usa 'Flujos' para identificar acciones, procesos o diagramas específicos que apoyan la respuesta.\n"
-            "- Revisa 'topicos no cubiertos' para DESCARTAR documentos que explícitamente no traten partes clave de la pregunta.\n"
-            "- No inventes información: decide SOLO con lo que aparece en los candidatos.\n\n"
-
-            "CÓMO DECIDIR LOS FLUJOS:\n"
-            "- Selecciona únicamente los flujos que estén directamente relacionados con la pregunta del usuario.\n"
-            "- Si la pregunta pide una acción, proceso, procedimiento, paso a paso, flujo o cómo hacer algo, prioriza los flujos cuyo título coincida con esa intención.\n"
-            "- Si varios flujos del mismo documento apoyan la pregunta, incluye todos sus números en orden ascendente.\n"
-            "- Si un flujo es de un caso parecido pero no del caso preguntado, no lo selecciones.\n"
-            "- No selecciones flujos de documentos no elegidos.\n"
-            "- No selecciones un flujo solo porque existe; debe apoyar directamente la pregunta.\n\n"
-
-            "HARD CONSTRAINTS (OBLIGATORIAS / PENALIZACIÓN MUY FUERTE SI NO SE CUMPLEN):\n"
-            "0) Antes de aplicar coincidencias por escenario, identifica la INFORMACIÓN principal que el usuario está pidiendo, no solo el contexto mencionado. Expresiones como 'en caso de', 'derivado de', 'por', 'debido a' o 'cuando ocurre' suelen introducir contexto o causa. La intención principal de la pregunta pesa más que el contexto; por tanto, si el contexto coincide con un documento general pero la información pedida coincide con un documento más específico, elige el documento específico.\n"
-            "1) Si la pregunta contiene un código/SSR o acrónimo específico, por ejemplo 'MAAS', 'INCU', 'WCHR',\n"
-            "   SOLO son elegibles documentos donde ese código aparezca literalmente en titulo/descripción/topicos/flujos,\n"
-            "   o un sinónimo directo inequívoco, por ejemplo MAAS = 'máxima asistencia'.\n"
-            "2) Restricciones explícitas del enunciado: si la pregunta menciona canal, herramienta, sistema, país,\n"
-            "   producto, normativa, mercado, rol o sigla operativa, esa mención debe aparecer o estar claramente implicada.\n"
-            "   Para eventos amplios como atraso, cancelación, cambio involuntario o contingencia, trátalos como contexto,\n"
-            "   salvo que la pregunta pida explícitamente el procedimiento general de ese evento.\n"
-            "3) Si la pregunta exige un canal concreto, por ejemplo 'por email', penaliza fuerte documentos cuyo foco sea otro canal,\n"
-            "   por ejemplo WhatsApp, Chat o voz, y que NO mencionen el canal solicitado.\n"
-            "4) Si la pregunta incluye 2 o más condiciones, gana el documento que cumpla MÁS condiciones simultáneamente,\n"
-            "   aunque otro documento sea muy fuerte en solo una de ellas.\n"
-            "5) Si 'topicos no cubiertos' declara que NO cubre una restricción explícita, descártalo o penalízalo al máximo.\n"
-            "6) Si la pregunta menciona explícitamente una normativa/mercado/rol o sigla operativa, por ejemplo\n"
-            "   'Código de Consumo PE', 'PE/Perú', 'no show', 'LUA', 'HVC', SOLO son elegibles documentos que mencionen literalmente\n"
-            "   esa misma señal en titulo/descripción/topicos/flujos/intents, o una variante obvia, por ejemplo 'Perú' para 'PE'.\n"
-            "   Si ningún documento menciona esas señales, elige el más cercano por intención y con menor conflicto en 'topicos no cubiertos'.\n"
-            "7) Si la pregunta contiene 'Staff travel' o 'consola', solo son elegibles docs que mencionen 'Staff travel'\n"
-            "   o el sistema/consola correspondiente. Si ninguno lo menciona, recién ahí cae al más cercano.\n\n"
-
-            "HEURÍSTICA DE SELECCIÓN:\n"
-            "A) Primero elige el documento más alineado con la pregunta.\n"
-            "B) Luego, dentro de ese documento, elige los flujos que apoyen directamente la pregunta.\n"
-            "C) Si el título de un flujo coincide semánticamente con la pregunta, es fuerte candidato.\n"
-            "D) Si varios documentos parecen relevantes, elige el que tenga mejor combinación de descripción + topicos + intents + flujos.\n"
-            "E) Si ninguno responde perfectamente, elige el MÁS cercano con mejor cobertura parcial y menor conflicto.\n\n"
-
-            "EJEMPLOS DE SALIDA:\n"
-            "- Pregunta: '¿como es la accion o flujo de exceso en equipaje?'\n"
-            "- Documento elegido: 2\n"
-            "- Flujos relevantes dentro del documento:\n"
-            "  1) Flujo Emisión Exceso de Equipaje\n"
-            "  2) Flujo Emisión Oversize de Equipaje\n"
-            "- Respuesta correcta si solo aplica exceso de equipaje: (2)[1]\n"
-            "- Respuesta correcta si aplican exceso y oversize: (2)[1,2]\n\n"
-
-            "IMPORTANTE:\n"
-            "- No inventes IDs.\n"
-            "- No inventes números de flujo.\n"
-            "- No expliques tu decisión.\n"
-            "- No devuelvas títulos de flujos, solo sus números.\n"
-            "- La númeración de flujos se reinicia (vuelve a 1) por cada documento"
-            "- Debes escoger un único documento incluso si la cobertura es parcial.\n\n"
-
-            f"PREGUNTA DEL USUARIO:\n{question}\n\n"
-
-            "DOCUMENTOS CANDIDATOS (formato fijo):\n"
-            "Cada candidato aparece como:\n"
-            "Documento X:\n"
-            "  -id: <id>\n"
-            "  -titulo: <titulo>\n"
-            "  -descripción: <descripción>\n"
-            "  -Flujos:\n"
-            "    1) <titulo_flujo_1>\n"
-            "    2) <titulo_flujo_2>\n"
-            "    3) <titulo_flujo_3>\n"
-            "  -topicos: <topicos>\n"
-            "  -topicos no cubiertos (excluyente): <not_covered>\n"
-            "  -intents: <intents>\n\n"
-
-            f"{docs_text}\n\n"
-
-            "RESPUESTA OBLIGATORIA, SOLO EN FORMATO (<id_documento>)[<numeros_de_flujo_seleccionado>]:"
-        )
-        respuesta_ia = _invoke_chat(SONNET_45_MODEL_ID, prompt_chunks, max_tokens=100, temperature=0.0).strip()
-    
-        chosen_id, chosen_flujos = parsear_respuesta_ia(respuesta_ia)
-
-        print("[SELECCION] prompt_reranking:", prompt_chunks, sep="\n")
-        print("[SELECCION] chosen_doc_id_ia:", chosen_id)
-        print("[SELECCION] chosen_flujos_ia:", chosen_flujos)
-    
-        chosen_candidate = next((c for c in candidate_docs if c["id"] == chosen_id), None)
-
-        if not chosen_candidate:
-            print("[SELECCION] No se encontró candidato para ese id; fallback a primero")
-            chosen_candidate = candidate_docs[0]
-            
-        selected_doc = chosen_candidate["doc"]
-
-    print("[SELECCION] articulo_a_utilizar:")
-    print(f"{selected_doc}")
-
-    mark(execution_times, 'chunkSelection_totalTime', t4)
-    print("========== FIN - SELECCIÓN ARTICULO ==========")
-    print("***********************************************************")
-    t5 = tstart()
-    print("========== INICIO - INYECCIÓN DEPENDENCIAS ==========")
-
-    title_to_show = selected_doc.get("title", "Título no encontrado")
-    print("[DEPENDENCIAS] title_to_show:", title_to_show)
-
-    raw = selected_doc.get("raw", {})  # chunk original de Bedrock
-
-    rag_files = (
-        raw.get('location', {})
-        .get('s3Location', {})
-        .get('uri', '')
-        .replace(CONFIG.s3_files_prefix, '')
-    )
-
-    sel_text = (
-        raw.get('content', {})
-        .get('text', '')
-    )
-
-    meta = raw.get('metadata', {})
-
-    print("[DEPENDENCIAS] sel_text_original:")
-    print(sel_text)
-
-
-    # =====================================================
-    # RESCATAR FLUJOS SELECCIONADOS POR LA IA
-    # =====================================================
-
-    selected_flows = obtener_flujos_seleccionados(meta, chosen_flujos)
-
-    print("[DEPENDENCIAS] flujos_seleccionados_metadata:")
-    print(selected_flows)
-
-    selected_flow_urls_norm = {
-        flujo["url_norm"]
-        for flujo in selected_flows
-        if flujo.get("url_norm")
-    }
-
-    selected_flow_titles_norm = {
-        flujo.get("titulo_norm") or normalizar_texto_para_match(flujo.get("titulo", ""))
-        for flujo in selected_flows
-        if flujo.get("titulo_norm") or flujo.get("titulo")
-    }
-
-    print("[DEPENDENCIAS] selected_flow_urls_norm:")
-    print(selected_flow_urls_norm)
-
-    print("[DEPENDENCIAS] selected_flow_titles_norm:")
-    print(selected_flow_titles_norm)
-
-
-    # =====================================================
-    # LINKS HTML SOLO DE FLUJOS SELECCIONADOS
-    # =====================================================
-
-    links_seleccionados = [
-        f"{flujo['url']};{flujo['titulo']}"
-        for flujo in selected_flows
-    ]
-
-    print("[DEPENDENCIAS] links_seleccionados_raw:")
-    print(links_seleccionados)
-
-    links = convertir_links_a_html(links_seleccionados)
-
-    print("[DEPENDENCIAS] links_seleccionados_html:")
-    print(links)
-
-
-    # =====================================================
-    # METADATA RESPONSE
-    # =====================================================
-
-    metadata_response = {
-        "tablas": meta.get("tablas", []),
-        "flujos": meta.get("flujos", []),
-    }
-
-
-    # =====================================================
-    # GLOSARIO
-    # =====================================================
-
-    glosario_uris = meta.get('glosario', []) or []
-
-    glosario_str = ""
-
-    for uri in glosario_uris:
-        try:
-            raw_txt, used_uri = fetch_with_fallback(uri)
-            txt = normalize_text(raw_txt)
-            glosario_str += txt + "\n"
-
-        except Exception:
-            glosario_str += f"No encontre contenido en glosario: {uri}\n"
-            continue
-
-
-    # =====================================================
-    # FASE 1: INYECTAR SOLO TABLAS
-    # =====================================================
-
-    print("----------FASE 1 - INYECCIÓN TABLAS----------")
-
-    tablas_uris = meta.get('tablas', []) or []
-
-    print("TABLAS URIS desde metadata:")
-    print(tablas_uris)
-
-    metadata_tablas, uri_to_content_tablas = cargar_dependencias(tablas_uris)
-
-    print("Metadata tablas:")
-    print(metadata_tablas)
-
-    context_text = inyectar_dependencias_por_tipo(
-        texto=sel_text,
-        uri_to_content=uri_to_content_tablas,
-        tipo="TABLA"
-    )
-
-    print("Texto después de inyectar TABLAS:")
-    print(context_text)
-
-
-    # =====================================================
-    # FASE 2: FILTRAR FLUJOS NO SELECCIONADOS
-    # SOBRE EL TEXTO RESULTANTE DE TABLAS
-    # =====================================================
-
-    print("----------FASE 2 - FILTRO FLUJOS SELECCIONADOS----------")
-
-    print("Texto ANTES de filtrar FLUJOS:")
-    print(context_text)
-
-    context_text = filtrar_flujos_no_seleccionados_en_texto(
-        sel_text=context_text,
-        selected_flow_urls_norm=selected_flow_urls_norm,
-        selected_flow_titles_norm=selected_flow_titles_norm
-    )
-
-    print("Texto DESPUÉS de filtrar FLUJOS no seleccionados:")
-    print(context_text)
-
-
-    # =====================================================
-    # FASE 3: EXTRAER FLUJOS DESPUÉS DE INYECTAR TABLAS
-    # =====================================================
-
-    print("----------FASE 3 - EXTRACCIÓN FLUJOS POST-TABLAS----------")
-
-    flujos_uris = extraer_uris_por_tipo(
-        texto=context_text,
-        tipo="FLUJO"
-    )
-
-    print("FLUJOS URIS encontrados después de inyectar tablas y filtrar:")
-    print(flujos_uris)
-
-
-    # =====================================================
-    # FASE 4: INYECTAR SOLO FLUJOS SELECCIONADOS
-    # =====================================================
-
-    print("----------FASE 4 - INYECCIÓN FLUJOS----------")
-
-    metadata_flujos, uri_to_content_flujos = cargar_dependencias(flujos_uris)
-
-    print("Metadata flujos:")
-    print(metadata_flujos)
-
-    context_text = inyectar_dependencias_por_tipo(
-        texto=context_text,
-        uri_to_content=uri_to_content_flujos,
-        tipo="FLUJO"
-    )
-
-    print("Texto final después de inyectar FLUJOS:")
-    print(context_text)
-
-
-    # =====================================================
-    # METADATA LIST FINAL
-    # =====================================================
-
-    metadata_list = metadata_tablas + metadata_flujos
-
-    uri_to_content: Dict[str, str] = {}
-
-    for item in metadata_list:
-        uri_norm = normalize_s3_uri(item.get("uri", ""))
-        content = item.get("content", "") or ""
-        uri_to_content[uri_norm] = content
-
-    print("Metadata List final:")
-    print(metadata_list)
-
-
-    # =====================================================
-    # CONTEXTO FINAL
-    # =====================================================
-
-    context_text = "Glosario: " + glosario_str + "Artículo: " + context_text
-
-    print("Context text final:")
-    print(context_text)
-    # print(f"----------INICIO - INYECCIÓN DEPENDENCIAS----------")
-
-    mark(execution_times, 'loadChunk', t5)
-    print("========== FIN - INYECCIÓN DEPENDENCIAS ==========")
-    print("***********************************************************")
-    t6 = tstart()
-    print("========== INICIO - GENERAR RESPUESTA ==========")
-    articulo = context_text
-    
-    print("[GENERAR_RESPUESTA] len_articulo:", len(articulo))
-    print(articulo)
-
-    answer_prompt = (
-        "STRICT INSTRUCTIONS (FOLLOW EXACTLY):\n"
-        "\n"
-        "1) SINGLE SOURCE OF TRUTH:\n"
-        "   — You may only use the INFORMATION section.\n"
-        "   — Do not use external knowledge.\n"
-        "   — Do not make inferences beyond the text.\n"
-        "   — Do not invent steps, deadlines, policies, processes, or conditions that are not mentioned.\n"
-        "   — FORBIDDEN: Do not invent exceptions, do not assume markets, and do not name countries that are not explicitly written in the provided INFORMATION.\n"
-        "\n"
-        "2) COMPLETE COVERAGE:\n"
-        "   — If the INFORMATION shows different rules by country (Argentina, Chile, Colombia, Uruguay, etc.), "
-        "you must include ALL explicit rules for EACH mentioned country.\n"
-        "   — Do not assume the question refers only to Chile.\n"
-        "\n"
-        "3) WHEN INFORMATION IS MISSING:\n"
-        "   — If there is NOT enough evidence in INFORMATION to answer the question, respond with exactly this string and nothing else: NOT FOUND\n"
-        "   — Do not wrap NOT FOUND in <RESUMEN>, [ADICIONAL], quotes, bullets, explanations, or any other text.\n"
-        "   — Do not translate NOT FOUND, regardless of the selected response language.\n"
-        "   — If the information is PARTIAL, do NOT use NOT FOUND. Answer only what is explicitly shown and clearly mention which points are not documented.\n"
-        "\n"
-        "4) RESPONSE STYLE:\n"
-        f"   — Respond only in LANGUAGE: {_normalize_language_filter(language)}.\n"
-        "   — The language value will be either Spanish or Portuguese.\n"
-        "   — Do not mix languages, except for proper names, system names, labels, or terms that must remain unchanged.\n"
-        "   — Always keep these terms exactly as written, without translating them: Latam Wallet, RESUMEN, ADICIONAL, NOT FOUND.\n"
-        "   — First, answer the question DIRECTLY.\n"
-        "   — COMPLETE FLOW RULE: If the question or process involves a support flow or operational steps, you MUST detail the procedure from beginning to end, but only with steps explicitly documented in INFORMATION. Include final actions in the systems, settlement, and the final closure or notification to the customer only if those elements are documented. If part of the flow is missing, clearly state which part is not documented.\n"
-        "   — LOGICAL CONDITIONALS RULE: Pay strict attention to the conditions in the question (e.g., 'if it was completed successfully', 'if it failed', 'if the person is a minor'). You must search the INFORMATION for the process branch that corresponds EXACTLY to that state. Do not mix steps from a successful process with steps from a failed process or an exception process.\n"
-        "   — ANCHORING DISCARD RULE: Do not choose a section of the INFORMATION only because it shares identical words with the question (e.g., 'Latam Wallet'). If the question describes an issue with one tool, but the documented solution requires migrating to another one (e.g., moving from Wallet to Bank Transfer in TV Web), you must prioritize the procedure that solves the specific situation described, not the one that repeats the words from the question more often.\n"
-        "   — Only include links if they appear explicitly in INFORMATION, start with https://, and belong to an allowed domain such as drive.google.com or docs.google.com.\n"
-        "   — Use terminology faithful to the document, but paraphrase whenever possible. Do not copy full passages literally.\n"
-        "\n"
-        "IMPORTANT OUTPUT EXCEPTION:\n"
-        "   — The RESUMEN and ADICIONAL format applies only when there is enough information to answer at least partially.\n"
-        "   — If there is not enough evidence in INFORMATION, the entire response must be exactly: NOT FOUND\n"
-        "\n"
-        "--------------------------------------------------\n"
-        "-INFORMATION:\n"
-        f"{articulo}.\n"
-        "\n"
-        "--------------------------------------------------\n"
-        "-AGENT QUESTION:\n"
-        f"{question}\n"
-        "--------------------------------------------------\n"
-        "5) OUTPUT FORMAT: RESUMEN (STRICT):\n"
-        "   <RESUMEN>\n"
-        "   — A single direct and specific paragraph answering ONLY the question.\n"
-        "   — Include EXACT numbers, EXACT conditions, and wording faithful to the document.\n"
-        "   — It must open with '<RESUMEN>' and close with '</RESUMEN>'.\n"
-        "   </RESUMEN>\n"
-        "\n"
-        "5.1) OUTPUT FORMAT: ADICIONAL (STRICT):\n"
-        "   [ADICIONAL]\n"
-        "   — List 2 to 10 bullet points with relevant additional details, without inventing anything.\n"
-        "   — Include country-specific rules if they exist.\n"
-        "   — Do not add steps that are not mentioned in INFORMATION.\n"
-        "   — It must open with '[ADICIONAL]' and close with '[/ADICIONAL]'.\n"
-        "   [/ADICIONAL]\n"
-        "\n"
-    )
-    try:
-        MAX_RETRIES = 7
-
-        full_answer = None
-        timed_out = False
-        not_found_rerank_attempted = True
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                full_answer, timed_out = _invoke_chat_with_timeout(
-                    GPT_OSS_120_MODEL_ID,
-                    answer_prompt,
-                    max_tokens=ANSWER_MAX_TOKENS,
-                    temperature=0.0
-                )
-
-                full_answer = (full_answer or "")
-                full_answer, reasoning_blocks = split_reasoning_blocks(full_answer)
-                reasoning_text = "\n\n".join(reasoning_blocks)
-                print("[GENERAR_RESPUESTA] razonamiento:", reasoning_text)
-                print("[GENERAR_RESPUESTA] answer:", full_answer)
-                
-
-                if full_answer == "NOT FOUND":
-                    not_found_rerank_attempted = True
-                    initial_doc_id = get_doc_unique_id(selected_doc)
-                    print("[GENERAR_RESPUESTA] NOT FOUND en primer documento; reintentando sin doc_id:", initial_doc_id)
-
-                    retry_candidate, retry_chosen_flujos, retry_prompt_chunks, retry_docs_text = rerank_candidate_document(
-                        candidate_docs,
-                        question,
-                        excluded_doc_id=initial_doc_id,
-                    )
-
-                    if not retry_candidate:
-                        full_answer = localized_not_found_message(language)
-                        break
-
-                    selected_doc = retry_candidate["doc"]
-                    chosen_flujos = retry_chosen_flujos
-
-                    print("[GENERAR_RESPUESTA] articulo_a_utilizar_en_reintento:")
-                    print(f"{selected_doc}")
-
-                    retry_payload = prepare_selected_doc_payload(selected_doc, chosen_flujos)
-                    title_to_show = retry_payload["title_to_show"]
-                    raw = retry_payload["raw"]
-                    rag_files = retry_payload["rag_files"]
-                    sel_text = retry_payload["sel_text"]
-                    meta = retry_payload["meta"]
-                    links = retry_payload["links"]
-                    metadata_response = retry_payload["metadata_response"]
-                    metadata_list = retry_payload["metadata_list"]
-                    context_text = retry_payload["context_text"]
-                    articulo = retry_payload["articulo"]
-                    answer_prompt = build_answer_prompt(question, language, articulo)
-
-                    print("[GENERAR_RESPUESTA] len_articulo_reintento:", len(articulo))
-                    print(articulo)
-
-                    full_answer, timed_out = _invoke_chat_with_timeout(
-                        GPT_OSS_120_MODEL_ID,
-                        answer_prompt,
-                        max_tokens=ANSWER_MAX_TOKENS,
-                        temperature=0.0
-                    )
-                    full_answer = (full_answer or "")
-                    full_answer, reasoning_blocks = split_reasoning_blocks(full_answer)
-                    reasoning_text = "\n\n".join(reasoning_blocks)
-                    print("[GENERAR_RESPUESTA] razonamiento_reintento:", reasoning_text)
-                    print("[GENERAR_RESPUESTA] answer_reintento:", full_answer)
-
-                    if full_answer == "NOT FOUND":
-                        full_answer = localized_not_found_message(language)
-                        break
-
-                # Si el modelo falló (según tu contrato), reintentamos
-                if full_answer == "Intermitencia de Servicio":
-                    if attempt < MAX_RETRIES:
-                        continue
-                    # último intento y falló -> rompemos para caer al fallback
-                    break
-                    
-                break
-
-            except Exception:
-                # Excepción inesperada: reintenta también (opcional)
-                if attempt < MAX_RETRIES:
-                    continue
-                full_answer = "Intermitencia de Servicio"
-                break
-
-        # Fallback final si quedó en error / None / vacío por cualquier motivo
-        if not full_answer or full_answer == "Intermitencia de Servicio":
-            full_answer = "Intermitencia de Servicio"
-
-    except Exception:
-        full_answer = "Intermitencia de Servicio"
-
     print("[GENERAR_RESPUESTA] full_answer:", full_answer)
     print("[GENERAR_RESPUESTA] prompt_qna:", answer_prompt)
 
-    mark(execution_times, 'generateAnswer_totalTime', t6)
-    print("========== FIN - GENERAR RESPUESTA ==========")
-    print("***********************************************************")
     if not timed_out:
         t7 = tstart()
         print("========== INICIO - PARSEAR RESUMEN Y INFO ADICIONAL ==========")
