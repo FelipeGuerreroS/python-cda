@@ -532,19 +532,6 @@ def _retrieve_and_generate_model_arn(model_id: str) -> str:
     return f"arn:aws:bedrock:{AWS_REGION}::foundation-model/{model_id}"
 
 
-def build_orchestration_prompt(language: Optional[str]) -> str:
-    """Build the query-orchestration prompt required by custom RAG models."""
-    return (
-        "You are a Knowledge Base search-query orchestration system.\n"
-        "Create the most precise search query for the user's request without "
-        "answering it or adding facts that the user did not provide.\n"
-        f"Keep the query in LANGUAGE: {_normalize_language_filter(language)}.\n"
-        "USER QUERY:\n"
-        "$query$\n\n"
-        "$output_format_instructions$"
-    )
-
-
 def retrieve_and_generate_answer(
     question: str,
     language: Optional[str],
@@ -581,17 +568,6 @@ def retrieve_and_generate_answer(
                     },
                     "promptTemplate": {
                         "textPromptTemplate": prompt_template,
-                    },
-                },
-                "orchestrationConfiguration": {
-                    "inferenceConfig": {
-                        "textInferenceConfig": {
-                            "maxTokens": ANSWER_MAX_TOKENS,
-                            "temperature": 0.0,
-                        }
-                    },
-                    "promptTemplate": {
-                        "textPromptTemplate": build_orchestration_prompt(language),
                     },
                 },
             },
